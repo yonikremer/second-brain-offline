@@ -2,7 +2,7 @@
 title: Map of Content — LLM Finetuning
 type: index
 tags: [moc, index]
-updated: 2026-06-11
+updated: 2026-07-18
 ---
 
 # 🗺️ Map of Content — LLM Finetuning & Serving
@@ -45,6 +45,8 @@ Entry point for the vault. Built from the 8-lesson **Finetuning Sessions** serie
 - [[mythos-class-capabilities]] — claimed SOTA across SWE, knowledge work, vision, memory, life sciences
 - [[fable-5-safety-classifiers]] — classifier safeguards that fall back to Opus 4.8
 - [[mythos-trusted-access]] — Project Glasswing, trusted-access programs, 30-day data retention
+- [[chinese-frontier-models]] — benchmark-driven comparison of Chinese MoE frontier models (GLM-5, MiniMax, Kimi, Qwen, MiMo)
+- [[openrouter-fusion]] — model synthesis via a panel + judge for deep research tasks
 
 ## Analyses
 

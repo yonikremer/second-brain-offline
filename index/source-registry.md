@@ -2,12 +2,12 @@
 title: Source Registry
 type: index
 tags: [sources, registry]
-updated: 2026-06-11
+updated: 2026-07-18
 ---
 
 # 📚 Source Registry
 
-All raw clippings, captured with the Obsidian web clipper from **The Neural Maze** (Substack), author **Miguel Otero Pedrido**, series *Finetuning Sessions* (8 lessons). Status: all 8 ingested 2026-06-11 into `wiki/` notes and the graphify knowledge graph.
+All raw clippings, captured with the Obsidian web clipper from **The Neural Maze** (Substack), author **Miguel Otero Pedrido**, series *Finetuning Sessions* (8 lessons). Status: core 8 ingested 2026-06-11; two later clippings ingested 2026-07-18.
 
 | # | Clipping (raw/) | Published | Summary | Wiki notes derived |
 |---|---|---|---|---|
@@ -24,3 +24,5 @@ All raw clippings, captured with the Obsidian web clipper from **The Neural Maze
 
 Attention Is All You Need (1706.03762) · Scaling Laws (2001.08361) · InstructGPT (2203.02155) · LIMA (2305.11206) · LoRA (2106.09685) · AdamW (1711.05101) · PPO (1707.06347) · DPO (2305.18290) · GRPO/DeepSeekMath (2402.03300) · DeepSeek-R1 (2501.12948) · SNAC (2410.14411) · Qwen3-VL (2511.21631)
 | | [[Claude Fable 5 and Claude Mythos 5]] | 2026-06-16 | [[claude-fable-5-and-claude-mythos-5]] | |
+| | [[Chinese frontier models compared GLM-5, MiniMax M2.5 & M2.7, Kimi K2.5, Qwen 3.5, and MiMo-V2-Pro]] | 2026-02-28 | [[chinese-frontier-models-compared-glm-5-minimax-m2-5-m2-7-kimi-k2-5-qwen-3-5-and-mimo-v2-pro]] | [[chinese-frontier-models]] |
+| | [[Surpassing Frontier Performance with Fusion]] | 2026-06-12 | [[surpassing-frontier-performance-with-fusion]] | [[openrouter-fusion]] |

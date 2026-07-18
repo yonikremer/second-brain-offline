@@ -50,3 +50,12 @@ Added `index/data-sources.md`, bundle templates under `templates/data-source/`, 
 
 Added `index/apis.md`, bundle templates under `templates/api/`, and lint rules for `wiki/apis/` bundles.
 
+## [2026-07-18] ingest | Chinese frontier models compared: GLM-5, MiniMax M2.5 & M2.7, Kimi K2.5, Qwen 3.5, and MiMo-V2-Pro
+
+- source: [[Chinese frontier models compared GLM-5, MiniMax M2.5 & M2.7, Kimi K2.5, Qwen 3.5, and MiMo-V2-Pro]]
+- derived: [[chinese-frontier-models]]
+
+## [2026-07-18] ingest | Surpassing Frontier Performance with Fusion
+
+- source: [[Surpassing Frontier Performance with Fusion]]
+- derived: [[openrouter-fusion]]
