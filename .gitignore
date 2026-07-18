@@ -1,6 +1,7 @@
 .obsidian/
 .DS_Store
 .env
+.idea/
 graphify-out/.graphify_*
 __pycache__/
 *.pyc
