@@ -1,5 +1,5 @@
 """
-API: <api-name>
+API: example-api
 Purpose: one-sentence description of what this API provides.
 
 Authentication notes:

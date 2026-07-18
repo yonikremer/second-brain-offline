@@ -1,11 +1,11 @@
 ---
-title: "<Source Name> — Overview"
+title: "Example Source — Overview"
 type: concept
 tags: [data-source, overview]
 sources: []
 ---
 
-# <Source Name> — Overview
+# Example Source — Overview
 
 **One-sentence description of the data source and its primary purpose.**
 
@@ -36,11 +36,11 @@ Snowflake, internal API, etc.) and the organizational context.
 
 ## Tables
 
-See `tables.md` for the table guide and `tables/*.md` for per-table details.
+See [[example-data-source-tables]] for the table guide and `tables/example-data-source-table-*.md` for per-table details.
 
 ## Connection
 
-See `connect.py` for connection details and sample code.
+See `example-data-source-connect.py` for connection details and sample code.
 
 ## Related
 [[data-sources]]

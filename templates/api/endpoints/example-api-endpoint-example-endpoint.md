@@ -1,11 +1,11 @@
 ---
-title: "<API Name> — <Endpoint Name>"
+title: "Example API — Example Endpoint"
 type: concept
 tags: [api, endpoint]
 sources: []
 ---
 
-# <API Name> — <Endpoint Name>
+# Example API — Example Endpoint
 
 **One-sentence description of what this endpoint does.**
 
@@ -110,4 +110,4 @@ response = requests.get(
 - Connects to a vault concept note like [[lora]] if the endpoint models that concept.
 
 ## Related
-`endpoints.md` · [[apis]]
+[[example-api-endpoints]] · [[apis]]

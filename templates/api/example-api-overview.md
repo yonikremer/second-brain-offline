@@ -1,11 +1,11 @@
 ---
-title: "<API Name> — Overview"
+title: "Example API — Overview"
 type: concept
 tags: [api, overview]
 sources: []
 ---
 
-# <API Name> — Overview
+# Example API — Overview
 
 **One-sentence description of the API and its primary purpose.**
 
@@ -36,11 +36,11 @@ Include base URL, version, and any authentication scheme.
 
 ## Endpoints
 
-See `endpoints.md` for the endpoint guide and `endpoints/*.md` for per-endpoint details.
+See [[example-api-endpoints]] for the endpoint guide and `endpoints/example-api-endpoint-*.md` for per-endpoint details.
 
 ## Authentication
 
-See `auth.py` for authentication details and sample code.
+See `example-api-auth.py` for authentication details and sample code.
 
 ## Related
 [[apis]]

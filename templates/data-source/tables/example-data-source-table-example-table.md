@@ -1,11 +1,11 @@
 ---
-title: "<Source Name> — <Table Name>"
+title: "Example Source — Example Table"
 type: concept
 tags: [data-source, table]
 sources: []
 ---
 
-# <Source Name> — <Table Name>
+# Example Source — Example Table
 
 **One-sentence description of what this table represents.**
 
@@ -51,4 +51,4 @@ How does it relate to the overall data source?
 - Known data quality issues, nullability quirks, or stale-data caveats.
 
 ## Related
-`tables.md` · [[data-sources]]
+[[example-data-source-tables]] · [[data-sources]]

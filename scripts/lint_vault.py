@@ -25,12 +25,13 @@ def find(msg):
 
 
 def all_stems():
-    """All valid wikilink targets across raw/, wiki/, wiki/sources/, index/."""
+    """All valid wikilink targets across raw/, wiki/, and index/."""
     result = {}
-    for folder in [RAW, WIKI, WIKI / "sources", INDEX]:
+    for folder in [RAW, WIKI, INDEX]:
         if folder.exists():
-            for p in folder.glob("*.md"):
-                result[p.stem] = p
+            for p in folder.rglob("*.md"):
+                # Duplicates are reported separately; keep the first path.
+                result.setdefault(p.stem, p)
     return result
 
 
@@ -38,13 +39,107 @@ def wikilinks_in(text):
     return [m.group(1).strip() for m in re.finditer(r"\[\[([^\]|#]+)", text)]
 
 
+def has_frontmatter(path: Path) -> bool:
+    return path.read_text().strip().startswith("---")
+
+
+def sources_empty(text: str) -> bool:
+    """True if the frontmatter contains an empty sources list."""
+    return bool(re.search(r"sources:\s*\[\s*\]", text))
+
+
+def check_bundle_shape(
+    root: Path,
+    label: str,
+    overview_suffix: str,
+    py_suffix: str,
+    guide_suffix: str,
+    child_dir_name: str,
+    child_suffix: str,
+):
+    """Validate a bundle namespace (data-source or API).
+
+    Each file in a bundle carries a unique prefix so it can live in the
+    global wiki namespace. The linter checks the required shape and
+    cross-links so the standard orphan/reachability checks also pass.
+    """
+    if not root.exists():
+        return
+    for bundle in root.iterdir():
+        if not bundle.is_dir():
+            find(f"{label}: non-directory item in {root.relative_to(VAULT)}: {bundle.name}")
+            continue
+        rel = bundle.relative_to(VAULT)
+        md_files = list(bundle.rglob("*.md"))
+        py_files = list(bundle.rglob("*.py"))
+
+        overviews = [p for p in md_files if p.name.endswith(overview_suffix)]
+        if not overviews:
+            find(f"{label}: missing *{overview_suffix} in {rel}")
+        else:
+            for p in overviews:
+                if not has_frontmatter(p):
+                    find(f"{label}: {p.name} missing frontmatter in {rel}")
+
+        pys = [p for p in py_files if p.name.endswith(py_suffix)]
+        if not pys:
+            find(f"{label}: missing *{py_suffix} in {rel}")
+        else:
+            for p in pys:
+                text = p.read_text().strip()
+                if not text.startswith(('"""', "'''", "#")):
+                    find(f"{label}: {p.name} missing docstring/comment header in {rel}")
+
+        guides = [p for p in md_files if p.name.endswith(guide_suffix)]
+        if not guides:
+            find(f"{label}: missing *{guide_suffix} in {rel}")
+        else:
+            for p in guides:
+                if not has_frontmatter(p):
+                    find(f"{label}: {p.name} missing frontmatter in {rel}")
+
+        child_dir = bundle / child_dir_name
+        if not child_dir.exists():
+            find(f"{label}: missing {child_dir_name}/ directory in {rel}")
+        elif not child_dir.is_dir():
+            find(f"{label}: {child_dir_name} is not a directory in {rel}")
+        else:
+            child_files = sorted(p for p in child_dir.iterdir() if p.is_file())
+            for p in child_files:
+                if p.suffix != ".md":
+                    find(f"{label}: non-markdown file in {p.relative_to(VAULT)}")
+            child_md = [
+                p for p in child_files
+                if p.suffix == ".md" and p.name.endswith(child_suffix)
+            ]
+            for p in child_md:
+                if not has_frontmatter(p):
+                    find(f"{label}: child file missing frontmatter: {p.relative_to(VAULT)}")
+            for guide in guides:
+                guide_links = set(wikilinks_in(guide.read_text()))
+                for p in child_md:
+                    if p.stem not in guide_links:
+                        find(
+                            f"{label}: {guide.name} does not link to [[{p.stem}]]"
+                            f" ({p.relative_to(VAULT)})"
+                        )
+
+        # The overview should link to the guide so the guide is reachable.
+        for overview in overviews:
+            overview_links = set(wikilinks_in(overview.read_text()))
+            for guide in guides:
+                if guide.stem not in overview_links:
+                    find(
+                        f"{label}: {overview.name} does not link to [[{guide.stem}]]"
+                        f" ({guide.relative_to(VAULT)})"
+                    )
+
+
 stems = all_stems()
 
 # 1. Broken wikilinks
 for folder in [WIKI, INDEX]:
     for p in folder.rglob("*.md"):
-        if DATA_SOURCES in p.parents or APIS in p.parents:
-            continue
         for link in wikilinks_in(p.read_text()):
             if link not in stems and link not in KNOWN_EXTERNAL:
                 find(f"BROKEN WIKILINK: [[{link}]] in {p.relative_to(VAULT)}")
@@ -53,14 +148,10 @@ for folder in [WIKI, INDEX]:
 linked_to = set()
 for folder in [WIKI, INDEX]:
     for p in folder.rglob("*.md"):
-        if DATA_SOURCES in p.parents or APIS in p.parents:
-            continue
         for link in wikilinks_in(p.read_text()):
             linked_to.add(link)
 
 for p in WIKI.rglob("*.md"):
-    if DATA_SOURCES in p.parents or APIS in p.parents:
-        continue
     if p.stem not in linked_to:
         find(f"ORPHAN NOTE: {p.relative_to(VAULT)} has no inbound links")
 
@@ -69,14 +160,16 @@ for p in RAW.glob("*.md"):
     if p.stem not in linked_to:
         find(f"UNREFERENCED RAW: {p.stem}")
 
-# 4. Wiki notes missing sources: frontmatter
-#    (index-type, analysis-type, and wiki/sources/ notes are exempt)
-for p in WIKI.glob("*.md"):
+# 4. Wiki notes missing or empty sources: frontmatter
+#    (index-type and analysis-type notes are exempt; source-summary notes must cite sources)
+for p in WIKI.rglob("*.md"):
     text = p.read_text()
     if "type: index" in text or "type: analysis" in text:
         continue
     if "sources:" not in text:
         find(f"MISSING SOURCES: {p.relative_to(VAULT)}")
+    elif sources_empty(text):
+        find(f"EMPTY SOURCES: {p.relative_to(VAULT)}")
 
 # 5. Each raw clipping has an ingest entry in log.md
 if LOG.exists():
@@ -103,8 +196,6 @@ if MOC.exists():
                 queue.append(stems[link])
     reachable = {p.stem for p in visited}
     for p in WIKI.rglob("*.md"):
-        if DATA_SOURCES in p.parents or APIS in p.parents:
-            continue
         if p.stem not in reachable:
             find(f"UNREACHABLE FROM MOC: {p.relative_to(VAULT)}")
 else:
@@ -112,10 +203,10 @@ else:
 
 # 7. Duplicate stems across folders
 seen_stems: dict[str, Path] = {}
-for folder in [RAW, WIKI, WIKI / "sources", INDEX]:
+for folder in [RAW, WIKI, INDEX]:
     if not folder.exists():
         continue
-    for p in folder.glob("*.md"):
+    for p in folder.rglob("*.md"):
         if p.stem in seen_stems:
             find(
                 f"DUPLICATE STEM: '{p.stem}' in {p.relative_to(VAULT)}"
@@ -125,98 +216,26 @@ for folder in [RAW, WIKI, WIKI / "sources", INDEX]:
             seen_stems[p.stem] = p
 
 # 8. Data-source bundle shape and conventions
-if DATA_SOURCES.exists():
-    for bundle in DATA_SOURCES.iterdir():
-        if not bundle.is_dir():
-            find(f"DATA SOURCE: non-directory item in wiki/data-sources/: {bundle.name}")
-            continue
-        rel = bundle.relative_to(VAULT)
-        overview_md = bundle / "overview.md"
-        connect_py = bundle / "connect.py"
-        tables_md = bundle / "tables.md"
-        tables_dir = bundle / "tables"
-        if not overview_md.exists():
-            find(f"DATA SOURCE: missing overview.md in {rel}")
-        elif not overview_md.read_text().strip().startswith("---"):
-            find(f"DATA SOURCE: overview.md missing frontmatter in {rel}")
-        if not connect_py.exists():
-            find(f"DATA SOURCE: missing connect.py in {rel}")
-        else:
-            text = connect_py.read_text().strip()
-            if not text.startswith(('"""', "'''", "#")):
-                find(f"DATA SOURCE: connect.py missing docstring/comment header in {rel}")
-        if not tables_md.exists():
-            find(f"DATA SOURCE: missing tables.md in {rel}")
-        elif not tables_md.read_text().strip().startswith("---"):
-            find(f"DATA SOURCE: tables.md missing frontmatter in {rel}")
-        if not tables_dir.exists():
-            find(f"DATA SOURCE: missing tables/ directory in {rel}")
-        elif not tables_dir.is_dir():
-            find(f"DATA SOURCE: tables is not a directory in {rel}")
-        else:
-            table_files = sorted(tables_dir.glob("*.md"))
-            for p in tables_dir.iterdir():
-                if p.is_file() and p.suffix != ".md":
-                    find(f"DATA SOURCE: non-markdown file in {p.relative_to(VAULT)}")
-            for p in table_files:
-                if not p.read_text().strip().startswith("---"):
-                    find(f"DATA SOURCE: table file missing frontmatter: {p.relative_to(VAULT)}")
-            if tables_md.exists():
-                tables_text = tables_md.read_text()
-                for p in table_files:
-                    reference = p.relative_to(bundle).as_posix()
-                    if reference not in tables_text:
-                        find(
-                            f"DATA SOURCE: tables.md does not mention {reference}"
-                            f" in {tables_md.relative_to(VAULT)}"
-                        )
+check_bundle_shape(
+    DATA_SOURCES,
+    "DATA SOURCE",
+    overview_suffix="-data-source-overview.md",
+    py_suffix="-data-source-connect.py",
+    guide_suffix="-data-source-tables.md",
+    child_dir_name="tables",
+    child_suffix="-data-source-table-",
+)
 
 # 9. API bundle shape and conventions
-if APIS.exists():
-    for bundle in APIS.iterdir():
-        if not bundle.is_dir():
-            find(f"API: non-directory item in wiki/apis/: {bundle.name}")
-            continue
-        rel = bundle.relative_to(VAULT)
-        overview_md = bundle / "overview.md"
-        auth_py = bundle / "auth.py"
-        endpoints_md = bundle / "endpoints.md"
-        endpoints_dir = bundle / "endpoints"
-        if not overview_md.exists():
-            find(f"API: missing overview.md in {rel}")
-        elif not overview_md.read_text().strip().startswith("---"):
-            find(f"API: overview.md missing frontmatter in {rel}")
-        if not auth_py.exists():
-            find(f"API: missing auth.py in {rel}")
-        else:
-            text = auth_py.read_text().strip()
-            if not text.startswith(('"""', "'''", "#")):
-                find(f"API: auth.py missing docstring/comment header in {rel}")
-        if not endpoints_md.exists():
-            find(f"API: missing endpoints.md in {rel}")
-        elif not endpoints_md.read_text().strip().startswith("---"):
-            find(f"API: endpoints.md missing frontmatter in {rel}")
-        if not endpoints_dir.exists():
-            find(f"API: missing endpoints/ directory in {rel}")
-        elif not endpoints_dir.is_dir():
-            find(f"API: endpoints is not a directory in {rel}")
-        else:
-            endpoint_files = sorted(endpoints_dir.glob("*.md"))
-            for p in endpoints_dir.iterdir():
-                if p.is_file() and p.suffix != ".md":
-                    find(f"API: non-markdown file in {p.relative_to(VAULT)}")
-            for p in endpoint_files:
-                if not p.read_text().strip().startswith("---"):
-                    find(f"API: endpoint file missing frontmatter: {p.relative_to(VAULT)}")
-            if endpoints_md.exists():
-                endpoints_text = endpoints_md.read_text()
-                for p in endpoint_files:
-                    reference = p.relative_to(bundle).as_posix()
-                    if reference not in endpoints_text:
-                        find(
-                            f"API: endpoints.md does not mention {reference}"
-                            f" in {endpoints_md.relative_to(VAULT)}"
-                        )
+check_bundle_shape(
+    APIS,
+    "API",
+    overview_suffix="-api-overview.md",
+    py_suffix="-api-auth.py",
+    guide_suffix="-api-endpoints.md",
+    child_dir_name="endpoints",
+    child_suffix="-api-endpoint-",
+)
 
 # Report
 total = len(stems)

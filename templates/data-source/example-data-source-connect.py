@@ -1,5 +1,5 @@
 """
-Data source: <source-name>
+Data source: example-data-source
 Purpose: one-sentence description of what this source contains.
 
 Connection notes:

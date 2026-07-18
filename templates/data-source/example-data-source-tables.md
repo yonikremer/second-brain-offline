@@ -1,11 +1,11 @@
 ---
-title: "<Source Name> — Tables"
+title: "Example Source — Tables"
 type: concept
 tags: [data-source, schema]
 sources: []
 ---
 
-# <Source Name> — Tables
+# Example Source — Tables
 
 **One-sentence description of the data source and the role its tables play.**
 
@@ -16,12 +16,11 @@ Call out any cross-cutting concerns (PII, retention, freshness, SLAs).
 
 ## Tables
 
-- `table-name` — brief description of what this table models
-  (details: `tables/table-name.md`)
+- [[example-data-source-table-example-table]] — brief description of what this table models
 
 ## Connection
 
-See `connect.py` for connection details and sample code.
+See `example-data-source-connect.py` for connection details and sample code.
 
 ## Related
 [[data-sources]]

@@ -1,11 +1,11 @@
 ---
-title: "<API Name> — Endpoints"
+title: "Example API — Endpoints"
 type: concept
 tags: [api, endpoints]
 sources: []
 ---
 
-# <API Name> — Endpoints
+# Example API — Endpoints
 
 **One-sentence description of the API and the role its endpoints play.**
 
@@ -16,12 +16,11 @@ and any cross-cutting concerns (auth, rate limits, versioning, deprecation).
 
 ## Endpoints
 
-- `endpoint-name` — brief description of what this endpoint does
-  (details: `endpoints/endpoint-name.md`)
+- [[example-api-endpoint-example-endpoint]] — brief description of what this endpoint does
 
 ## Authentication
 
-See `auth.py` for authentication details and sample code.
+See `example-api-auth.py` for authentication details and sample code.
 
 ## Related
 [[apis]]
