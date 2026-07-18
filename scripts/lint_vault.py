@@ -10,6 +10,7 @@ RAW = VAULT / "raw"
 WIKI = VAULT / "wiki"
 INDEX = VAULT / "index"
 DATA_SOURCES = WIKI / "data-sources"
+APIS = WIKI / "apis"
 LOG = INDEX / "log.md"
 MOC = INDEX / "_map-of-content.md"
 
@@ -42,7 +43,7 @@ stems = all_stems()
 # 1. Broken wikilinks
 for folder in [WIKI, INDEX]:
     for p in folder.rglob("*.md"):
-        if DATA_SOURCES in p.parents:
+        if DATA_SOURCES in p.parents or APIS in p.parents:
             continue
         for link in wikilinks_in(p.read_text()):
             if link not in stems and link not in KNOWN_EXTERNAL:
@@ -52,13 +53,13 @@ for folder in [WIKI, INDEX]:
 linked_to = set()
 for folder in [WIKI, INDEX]:
     for p in folder.rglob("*.md"):
-        if DATA_SOURCES in p.parents:
+        if DATA_SOURCES in p.parents or APIS in p.parents:
             continue
         for link in wikilinks_in(p.read_text()):
             linked_to.add(link)
 
 for p in WIKI.rglob("*.md"):
-    if DATA_SOURCES in p.parents:
+    if DATA_SOURCES in p.parents or APIS in p.parents:
         continue
     if p.stem not in linked_to:
         find(f"ORPHAN NOTE: {p.relative_to(VAULT)} has no inbound links")
@@ -102,7 +103,7 @@ if MOC.exists():
                 queue.append(stems[link])
     reachable = {p.stem for p in visited}
     for p in WIKI.rglob("*.md"):
-        if DATA_SOURCES in p.parents:
+        if DATA_SOURCES in p.parents or APIS in p.parents:
             continue
         if p.stem not in reachable:
             find(f"UNREACHABLE FROM MOC: {p.relative_to(VAULT)}")
@@ -163,11 +164,58 @@ if DATA_SOURCES.exists():
             if tables_md.exists():
                 tables_text = tables_md.read_text()
                 for p in table_files:
-                    reference = str(p.relative_to(bundle))
+                    reference = p.relative_to(bundle).as_posix()
                     if reference not in tables_text:
                         find(
                             f"DATA SOURCE: tables.md does not mention {reference}"
                             f" in {tables_md.relative_to(VAULT)}"
+                        )
+
+# 9. API bundle shape and conventions
+if APIS.exists():
+    for bundle in APIS.iterdir():
+        if not bundle.is_dir():
+            find(f"API: non-directory item in wiki/apis/: {bundle.name}")
+            continue
+        rel = bundle.relative_to(VAULT)
+        overview_md = bundle / "overview.md"
+        auth_py = bundle / "auth.py"
+        endpoints_md = bundle / "endpoints.md"
+        endpoints_dir = bundle / "endpoints"
+        if not overview_md.exists():
+            find(f"API: missing overview.md in {rel}")
+        elif not overview_md.read_text().strip().startswith("---"):
+            find(f"API: overview.md missing frontmatter in {rel}")
+        if not auth_py.exists():
+            find(f"API: missing auth.py in {rel}")
+        else:
+            text = auth_py.read_text().strip()
+            if not text.startswith(('"""', "'''", "#")):
+                find(f"API: auth.py missing docstring/comment header in {rel}")
+        if not endpoints_md.exists():
+            find(f"API: missing endpoints.md in {rel}")
+        elif not endpoints_md.read_text().strip().startswith("---"):
+            find(f"API: endpoints.md missing frontmatter in {rel}")
+        if not endpoints_dir.exists():
+            find(f"API: missing endpoints/ directory in {rel}")
+        elif not endpoints_dir.is_dir():
+            find(f"API: endpoints is not a directory in {rel}")
+        else:
+            endpoint_files = sorted(endpoints_dir.glob("*.md"))
+            for p in endpoints_dir.iterdir():
+                if p.is_file() and p.suffix != ".md":
+                    find(f"API: non-markdown file in {p.relative_to(VAULT)}")
+            for p in endpoint_files:
+                if not p.read_text().strip().startswith("---"):
+                    find(f"API: endpoint file missing frontmatter: {p.relative_to(VAULT)}")
+            if endpoints_md.exists():
+                endpoints_text = endpoints_md.read_text()
+                for p in endpoint_files:
+                    reference = p.relative_to(bundle).as_posix()
+                    if reference not in endpoints_text:
+                        find(
+                            f"API: endpoints.md does not mention {reference}"
+                            f" in {endpoints_md.relative_to(VAULT)}"
                         )
 
 # Report

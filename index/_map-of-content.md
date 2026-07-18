@@ -53,6 +53,7 @@ Entry point for the vault. Built from the 8-lesson **Finetuning Sessions** serie
 ## Other indices
 
 - [[data-sources]] — documented data source bundles and bundle convention
+- [[apis]] — documented API bundles and bundle convention
 - [[source-registry]] — provenance of all raw clippings (includes per-source summaries in `wiki/sources/`)
 - [[key-takeaways]] — distilled insights across the corpus
 - [[log]] — append-only ingest journal

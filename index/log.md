@@ -45,3 +45,8 @@ graphify: 141 nodes, 268 edges, 8 communities · qmd: 3 collections, 24 docs, 10
 ## [2026-07-18] build | Data-source knowledge template
 
 Added `index/data-sources.md`, bundle templates under `templates/data-source/`, and lint rules for `wiki/data-sources/` bundles.
+
+## [2026-07-18] build | API knowledge template
+
+Added `index/apis.md`, bundle templates under `templates/api/`, and lint rules for `wiki/apis/` bundles.
+
