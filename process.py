@@ -1,10 +1,9 @@
-import os
-import sys
-import re
-import json
-import sqlite3
-import hashlib
 import argparse
+import hashlib
+import json
+import re
+import sqlite3
+import sys
 from pathlib import Path
 
 # Verify dependencies are present immediately at start
@@ -128,8 +127,35 @@ def delete_downstream_cache(db_path: Path, file_hash: str, from_stage: str):
 
 # Stage Implementation Logic
 def check_guid_filename_ratio(text: str) -> bool:
+    # Check if content is JSON or XML (either raw or wrapped in markdown code blocks)
+    def is_valid_json(s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except ValueError:
+            return False
+
+    def is_valid_xml(s: str) -> bool:
+        try:
+            import xml.etree.ElementTree as ET
+            ET.fromstring(s)
+            return True
+        except ET.ParseError:
+            return False
+
+    cleaned = text.strip()
+    if cleaned:
+        if is_valid_json(cleaned) or is_valid_xml(cleaned):
+            return True
+        # Try stripping markdown code fences
+        m = re.match(r"^```(?:json|xml)?\s+(.*?)\s+```$", cleaned, re.DOTALL | re.IGNORECASE)
+        if m:
+            stripped = m.group(1).strip()
+            if is_valid_json(stripped) or is_valid_xml(stripped):
+                return True
+
     guid_pattern = re.compile(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b")
-    filename_pattern = re.compile(r"\b[\w\-]+\.(?:pdf|docx|doc|txt|md|html|png|jpg|jpeg|zip|json|yml|yaml|csv|xml|xls|xlsx)\b")
+    filename_pattern = re.compile(r"\b[\w\-]+\.(?:pdf|docx|doc|txt|md|html|png|jpg|jpeg|zip|json|yml|yaml|csv|xml|xls|xlsx|wav|32fc|16c|32f|one)\b")
     
     # Find spans to calculate union (avoid double-counting overlapping regions)
     spans = []

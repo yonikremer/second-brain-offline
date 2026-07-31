@@ -27,6 +27,26 @@ class TestPipelineLogic(unittest.TestCase):
         text = "This is a document about low-rank adaptation. It mentions one file my-doc.pdf and one GUID 54a06457-1820-49fe-8e1b-30fe482938a0."
         self.assertFalse(process.check_guid_filename_ratio(text))
 
+    def test_check_guid_filename_ratio_json(self):
+        # Raw JSON content
+        text = '{"name": "test", "data": [1, 2, 3]}'
+        self.assertTrue(process.check_guid_filename_ratio(text))
+        
+    def test_check_guid_filename_ratio_markdown_json(self):
+        # Markdown wrapped JSON
+        text = '```json\n{"name": "test", "data": [1, 2, 3]}\n```'
+        self.assertTrue(process.check_guid_filename_ratio(text))
+        
+    def test_check_guid_filename_ratio_xml(self):
+        # Raw XML content
+        text = '<root><element attribute="val">data</element></root>'
+        self.assertTrue(process.check_guid_filename_ratio(text))
+
+    def test_check_guid_filename_ratio_markdown_xml(self):
+        # Markdown wrapped XML
+        text = '```xml\n<root><element>data</element></root>\n```'
+        self.assertTrue(process.check_guid_filename_ratio(text))
+
     def test_needs_translation_hebrew(self):
         # Contains Hebrew words
         text = "שלום עולם! This is some English text." # 'שלום עולם' has 8 Hebrew letters. Total letters is 8 + 21 = 29. Ratio = 8/29 = 27% (>= 1%).
