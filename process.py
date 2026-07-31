@@ -229,6 +229,154 @@ def needs_translation(text: str) -> bool:
         return False
     return (hebrew_chars / total_letters) >= 0.01
 
+def parse_allowed_values(instruction_path: Path) -> list[str]:
+    if not instruction_path.exists():
+        return []
+    content = instruction_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    allowed_values = []
+    in_allowed_section = False
+    for line in lines:
+        if line.strip().startswith("## Allowed"):
+            in_allowed_section = True
+            continue
+        if in_allowed_section and line.strip().startswith("## "):
+            break
+        if in_allowed_section:
+            m = re.search(r"\*\*(.*?)\*\*", line)
+            if m:
+                allowed_values.append(m.group(1).strip())
+    return allowed_values
+
+def append_category_to_file(instr_path: Path, val: str, focus: str):
+    content = instr_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    
+    allowed_start_idx = -1
+    allowed_end_idx = -1
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("## Allowed"):
+            allowed_start_idx = idx
+        elif allowed_start_idx != -1 and line.strip().startswith("## ") and allowed_end_idx == -1:
+            allowed_end_idx = idx
+            break
+            
+    if allowed_end_idx == -1:
+        allowed_end_idx = len(lines)
+        
+    allowed_lines = lines[allowed_start_idx:allowed_end_idx]
+    
+    item_regex = re.compile(r"^(\d+)\.\s+\*\*(.*?)\*\*")
+    items = []
+    for rel_idx, line in enumerate(allowed_lines):
+        m = item_regex.match(line.strip())
+        if m:
+            items.append((rel_idx, int(m.group(1)), m.group(2).strip()))
+            
+    if not items:
+        new_item_lines = [
+            f"1. **{val}**",
+            f"   - Focus: {focus}" if focus else f"   - Focus: User-defined focus description."
+        ]
+        lines[allowed_end_idx:allowed_end_idx] = [""] + new_item_lines
+    else:
+        last_item_rel_idx, last_num, last_name = items[-1]
+        
+        insert_rel_idx = -1
+        new_num = -1
+        
+        if last_name.lower() == "other":
+            insert_rel_idx = last_item_rel_idx
+            new_num = last_num
+        else:
+            curr = last_item_rel_idx + 1
+            while curr < len(allowed_lines) and allowed_lines[curr].strip():
+                curr += 1
+            insert_rel_idx = curr
+            new_num = last_num + 1
+            
+        new_item_lines = [
+            f"{new_num}. **{val}**",
+            f"   - Focus: {focus}" if focus else f"   - Focus: User-defined focus description."
+        ]
+        
+        new_allowed_lines = list(allowed_lines[:insert_rel_idx])
+        if new_allowed_lines and new_allowed_lines[-1].strip():
+            new_allowed_lines.append("")
+        new_allowed_lines.extend(new_item_lines)
+        new_allowed_lines.append("")
+        
+        remaining_lines = allowed_lines[insert_rel_idx:]
+        for rel_line_idx in range(len(remaining_lines)):
+            line = remaining_lines[rel_line_idx]
+            m = item_regex.match(line.strip())
+            if m:
+                old_num = int(m.group(1))
+                line = line.replace(f"{old_num}.", f"{old_num + 1}.", 1)
+            new_allowed_lines.append(line)
+            
+        cleaned_allowed_lines = []
+        last_was_blank = False
+        for line in new_allowed_lines:
+            is_blank = not line.strip()
+            if is_blank and last_was_blank:
+                continue
+            cleaned_allowed_lines.append(line)
+            last_was_blank = is_blank
+            
+        lines[allowed_start_idx:allowed_end_idx] = cleaned_allowed_lines
+        
+    instr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+def verify_or_update_category(stage_name: str, val: str, instr_path: Path) -> str:
+    allowed_values = parse_allowed_values(instr_path)
+    val_clean = val.strip()
+    
+    matched = None
+    for allowed in allowed_values:
+        if val_clean.lower() == allowed.lower():
+            matched = allowed
+            break
+            
+    if matched:
+        return matched
+        
+    print(f"\n    [New {stage_name} Detected] LLM returned: '{val_clean}'")
+    print(f"    Current allowed values: {allowed_values}")
+    
+    if not sys.stdin.isatty():
+        print(f"    [Warning] Non-interactive environment. Accepting LLM value: '{val_clean}'")
+        append_category_to_file(instr_path, val_clean, f"Added automatically in non-interactive run.")
+        return val_clean
+
+    user_choice = input(f"Is '{val_clean}' a new {stage_name}? (y/n): ").strip().lower()
+    if user_choice in ("y", "yes"):
+        focus = input(f"Provide a short description/focus for '{val_clean}': ").strip()
+        append_category_to_file(instr_path, val_clean, focus)
+        print(f"    [Updated] Added '{val_clean}' to {instr_path.name}")
+        return val_clean
+    else:
+        print("Please choose one of the existing allowed values:")
+        for idx, allowed in enumerate(allowed_values, 1):
+            print(f"  {idx}. {allowed}")
+        while True:
+            selection = input(f"Enter number (1-{len(allowed_values)}) or type a custom value: ").strip()
+            if not selection:
+                continue
+            if selection.isdigit():
+                sel_idx = int(selection) - 1
+                if 0 <= sel_idx < len(allowed_values):
+                    return allowed_values[sel_idx]
+            confirm = input(f"Use custom value '{selection}'? (y/n): ").strip().lower()
+            if confirm in ("y", "yes"):
+                for allowed in allowed_values:
+                    if selection.lower() == allowed.lower():
+                        return allowed
+                focus = input(f"Provide a short description/focus for '{selection}': ").strip()
+                append_category_to_file(instr_path, selection, focus)
+                print(f"    [Updated] Added '{selection}' to {instr_path.name}")
+                return selection
+
 def call_llm(config: dict, system_prompt: str, user_prompt: str) -> str:
     api_base = config["llm"]["api_base"]
     api_key = config["llm"]["api_key"]
@@ -454,12 +602,16 @@ def process_file(
             trans_text = get_cached_stages(db_path, file_hash)["translation"]["output_text"]
             subdomain_instructions = instr_path.read_text(encoding="utf-8")
             subdomain_val = call_llm(config, subdomain_instructions, trans_text)
+            subdomain_val = verify_or_update_category("subdomain", subdomain_val, instr_path)
+            current_instr_hash = get_instruction_hash(instr_path)
             upsert_stage_output(db_path, file_hash, "subdomain", subdomain_val, current_model, current_instr_hash)
             
         elif stage == "doc_type":
             trans_text = get_cached_stages(db_path, file_hash)["translation"]["output_text"]
             doctype_instructions = instr_path.read_text(encoding="utf-8")
             doctype_val = call_llm(config, doctype_instructions, trans_text)
+            doctype_val = verify_or_update_category("doc_type", doctype_val, instr_path)
+            current_instr_hash = get_instruction_hash(instr_path)
             upsert_stage_output(db_path, file_hash, "doc_type", doctype_val, current_model, current_instr_hash)
             
         elif stage == "truthness":

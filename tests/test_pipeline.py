@@ -259,13 +259,13 @@ class TestInteractiveTranslation(unittest.TestCase):
         # Stage 3 first call -> Clarification
         # Stage 3 second call -> Hello
         # Stage 4 -> Tech
-        # Stage 5 -> concept
+        # Stage 5 -> how-to-guide
         # Stage 6 -> {"score": 9, "justification": "trusted"}
         mock_call_llm.side_effect = [
             "Clarification Required\nTerm/Issue: שלום\nContext: שלום עולם\nQuestion: How to translate?",
             "Hello",
             "Tech",
-            "concept",
+            "how-to-guide",
             '{"score": 9, "justification": "trusted"}'
         ]
         
@@ -316,7 +316,7 @@ class TestInteractiveTranslation(unittest.TestCase):
             "RTL_STATUS: REVERSED_WORDS\n",
             "RTL_STATUS: NORMAL\nGood morning",
             "Tech",
-            "concept",
+            "how-to-guide",
             '{"score": 9, "justification": "trusted"}'
         ]
         
@@ -391,7 +391,7 @@ class TestOneNoteConversion(unittest.TestCase):
         # Mock LLM calls
         mock_call_llm.side_effect = [
             "Tech",
-            "concept",
+            "how-to-guide",
             '{"score": 10, "justification": "trusted"}'
         ]
         
@@ -419,6 +419,89 @@ class TestOneNoteConversion(unittest.TestCase):
         out_content = out_file.read_text(encoding="utf-8")
         self.assertIn("Converted Markdown content", out_content)
         self.assertIn("truthness_score: 10", out_content)
+
+class TestCategoryVerification(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.temp_dir.name)
+        
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        
+    def test_parse_allowed_values(self):
+        doc_types_file = self.tmp_path / "document_types.md"
+        doc_types_file.write_text(
+            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n2. **other**\n   - Focus: Other\n\n## Output Format\n",
+            encoding="utf-8"
+        )
+        allowed = process.parse_allowed_values(doc_types_file)
+        self.assertEqual(allowed, ["concept", "other"])
+        
+    def test_append_category_before_other(self):
+        doc_types_file = self.tmp_path / "document_types.md"
+        doc_types_file.write_text(
+            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n2. **other**\n   - Focus: Other\n\n## Output Format\n",
+            encoding="utf-8"
+        )
+        process.append_category_to_file(doc_types_file, "how-to-guide", "Runbooks and guides")
+        
+        # Parse again
+        allowed = process.parse_allowed_values(doc_types_file)
+        self.assertEqual(allowed, ["concept", "how-to-guide", "other"])
+        
+        # Verify content formatting and numbering
+        content = doc_types_file.read_text(encoding="utf-8")
+        self.assertIn("2. **how-to-guide**", content)
+        self.assertIn("3. **other**", content)
+        
+    def test_append_category_no_other(self):
+        subdomains_file = self.tmp_path / "subdomains.md"
+        subdomains_file.write_text(
+            "# Title\n\n## Allowed Subdomains\n\n1. **AI**\n   - Topics: AI\n\n## Output Format\n",
+            encoding="utf-8"
+        )
+        process.append_category_to_file(subdomains_file, "DevOps", "CI/CD and deployment")
+        
+        allowed = process.parse_allowed_values(subdomains_file)
+        self.assertEqual(allowed, ["AI", "DevOps"])
+        
+        content = subdomains_file.read_text(encoding="utf-8")
+        self.assertIn("1. **AI**", content)
+        self.assertIn("2. **DevOps**", content)
+        
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("process.input")
+    def test_verify_or_update_category_interactive_yes(self, mock_input, mock_isatty):
+        doc_types_file = self.tmp_path / "document_types.md"
+        doc_types_file.write_text(
+            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n\n## Output Format\n",
+            encoding="utf-8"
+        )
+        
+        # Simulate user saying "yes, this is new" and providing description
+        mock_input.side_effect = ["y", "New description of how-to-guide"]
+        
+        val = process.verify_or_update_category("doc_type", "how-to-guide", doc_types_file)
+        self.assertEqual(val, "how-to-guide")
+        
+        allowed = process.parse_allowed_values(doc_types_file)
+        self.assertEqual(allowed, ["concept", "how-to-guide"])
+        
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("process.input")
+    def test_verify_or_update_category_interactive_no_then_choose(self, mock_input, mock_isatty):
+        doc_types_file = self.tmp_path / "document_types.md"
+        doc_types_file.write_text(
+            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n2. **other**\n   - Focus: Other\n\n## Output Format\n",
+            encoding="utf-8"
+        )
+        
+        # Simulate user saying "no, not new", then selecting index 2 ("other")
+        mock_input.side_effect = ["n", "2"]
+        
+        val = process.verify_or_update_category("doc_type", "unknown-type", doc_types_file)
+        self.assertEqual(val, "other")
 
 if __name__ == "__main__":
     unittest.main()
