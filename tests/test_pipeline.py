@@ -85,6 +85,22 @@ class TestPipelineLogic(unittest.TestCase):
         self.assertEqual(data["score"], 5)
         self.assertEqual(data["justification"], "blog post")
 
+    def test_fix_hebrew_layout_normal(self):
+        text = "בוקר טוב"
+        self.assertEqual(process.fix_hebrew_layout(text, "NORMAL"), "בוקר טוב")
+
+    def test_fix_hebrew_layout_reversed_words(self):
+        text = "רקוב בוט"
+        self.assertEqual(process.fix_hebrew_layout(text, "REVERSED_WORDS"), "בוקר טוב")
+
+    def test_fix_hebrew_layout_reversed_sentences(self):
+        text = "טוב בוקר"
+        self.assertEqual(process.fix_hebrew_layout(text, "REVERSED_SENTENCES"), "בוקר טוב")
+
+    def test_fix_hebrew_layout_reversed_both(self):
+        text = "בוט רקוב"
+        self.assertEqual(process.fix_hebrew_layout(text, "REVERSED_BOTH"), "בוקר טוב")
+
 class TestCascadeInvalidation(unittest.TestCase):
 
     def setUp(self):
@@ -285,6 +301,124 @@ class TestInteractiveTranslation(unittest.TestCase):
         out_content = out_file.read_text(encoding="utf-8")
         self.assertIn("Hello", out_content)
         self.assertIn("truthness_score: 9", out_content)
+
+    @patch("process.call_llm")
+    def test_translation_stage_with_reversed_words_retry(self, mock_call_llm):
+        from unittest.mock import patch, MagicMock
+        
+        raw_file = self.root / "raw" / "reversed.txt"
+        raw_file.write_text("בוט רקוב", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        mock_call_llm.side_effect = [
+            "RTL_STATUS: REVERSED_WORDS\n",
+            "RTL_STATUS: NORMAL\nGood morning",
+            "Tech",
+            "concept",
+            '{"score": 9, "justification": "trusted"}'
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "בוט רקוב"
+            mock_converter_cls.return_value = mock_conv
+            
+            process.process_file(
+                filepath=raw_file,
+                raw_root=self.root / "raw",
+                output_root=self.root / "processed_md",
+                db_path=db_path,
+                config=self.config,
+                force_stage=None
+            )
+            
+        out_file = self.root / "processed_md" / "reversed.md"
+        self.assertTrue(out_file.exists())
+        out_content = out_file.read_text(encoding="utf-8")
+        self.assertIn("Good morning", out_content)
+
+class TestOneNoteConversion(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        (self.root / "raw").mkdir()
+        (self.root / "instructions").mkdir()
+        (self.root / "processed_md").mkdir()
+        
+        (self.root / "instructions" / "translation.md").write_text("translation rules", encoding="utf-8")
+        (self.root / "instructions" / "subdomains.md").write_text("subdomain rules", encoding="utf-8")
+        (self.root / "instructions" / "document_types.md").write_text("doc type rules", encoding="utf-8")
+        (self.root / "instructions" / "truthness.md").write_text("truthness rules", encoding="utf-8")
+        
+        self.config = {
+            "llm": {
+                "api_base": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "llama3"
+            }
+        }
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @patch("subprocess.run")
+    @patch("process.DocumentConverter")
+    @patch("process.call_llm")
+    def test_onenote_conversion_flow(self, mock_call_llm, mock_docling, mock_run):
+        from unittest.mock import MagicMock
+        
+        # Create a dummy .one file
+        raw_file = self.root / "raw" / "notes.one"
+        raw_file.write_text("dummy", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        # Mock subprocess.run for PowerShell conversion
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_run.returncode = 0
+        mock_run.return_value = mock_res
+        
+        # Mock DocumentConverter
+        mock_conv = MagicMock()
+        mock_conv.convert.return_value.document.export_to_markdown.return_value = "Converted Markdown content"
+        mock_docling.return_value = mock_conv
+        
+        # Mock LLM calls
+        mock_call_llm.side_effect = [
+            "Tech",
+            "concept",
+            '{"score": 10, "justification": "trusted"}'
+        ]
+        
+        # Process the file
+        process.process_file(
+            filepath=raw_file,
+            raw_root=self.root / "raw",
+            output_root=self.root / "processed_md",
+            db_path=db_path,
+            config=self.config,
+            force_stage=None
+        )
+        
+        # Verify subprocess.run was called to convert the .one file
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        cmd = args[0]
+        self.assertTrue(cmd[4].endswith("convert_onenote.ps1"))
+        self.assertEqual(cmd[5], "-OnePath")
+        self.assertEqual(cmd[7], "-DocxPath")
+        
+        # Verify output markdown was created
+        out_file = self.root / "processed_md" / "notes.md"
+        self.assertTrue(out_file.exists())
+        out_content = out_file.read_text(encoding="utf-8")
+        self.assertIn("Converted Markdown content", out_content)
+        self.assertIn("truthness_score: 10", out_content)
 
 if __name__ == "__main__":
     unittest.main()

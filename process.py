@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -197,6 +198,30 @@ def check_guid_filename_ratio(text: str) -> bool:
     ratio = matched_non_ws / total_non_ws
     return ratio >= 0.80
 
+def fix_hebrew_layout(text: str, status: str) -> str:
+    if status == "NORMAL":
+        return text
+        
+    fixed_lines = []
+    for line in text.split('\n'):
+        words = line.split()
+        if not words:
+            fixed_lines.append("")
+            continue
+            
+        # Reverse characters of Hebrew words
+        if status in ("REVERSED_WORDS", "REVERSED_BOTH"):
+            words = [
+                w[::-1] if any('\u0590' <= c <= '\u05FF' for c in w) else w 
+                for w in words
+            ]
+        # Reverse word order of the sentence
+        if status in ("REVERSED_SENTENCES", "REVERSED_BOTH"):
+            words = words[::-1]
+            
+        fixed_lines.append(" ".join(words))
+    return "\n".join(fixed_lines)
+
 def needs_translation(text: str) -> bool:
     hebrew_chars = len(re.findall(r"[\u0590-\u05FF]", text))
     total_letters = len(re.findall(r"[a-zA-Z\u0590-\u05FF]", text))
@@ -316,9 +341,34 @@ def process_file(
         current_instr_hash = get_instruction_hash(instr_path) if instr_path else ""
         
         if stage == "docling":
-            converter = DocumentConverter()
-            result = converter.convert(str(filepath))
-            text_content = result.document.export_to_markdown()
+            if filepath.suffix.lower() == ".one":
+                print("    [OneNote] Converting .one file to temporary .docx via PowerShell COM...")
+                temp_docx = filepath.with_suffix(".temp.docx")
+                try:
+                    cmd = [
+                        "powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
+                        str(Path("scripts/convert_onenote.ps1").resolve()),
+                        "-OnePath", str(filepath.resolve()),
+                        "-DocxPath", str(temp_docx.resolve())
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        raise RuntimeError(
+                            f"OneNote COM conversion failed (exit code {res.returncode}).\n"
+                            f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}\n"
+                            "Tip: Make sure OneNote is open and running in the same privilege context as this script."
+                        )
+                    
+                    converter = DocumentConverter()
+                    result = converter.convert(str(temp_docx))
+                    text_content = result.document.export_to_markdown()
+                finally:
+                    if temp_docx.exists():
+                        temp_docx.unlink()
+            else:
+                converter = DocumentConverter()
+                result = converter.convert(str(filepath))
+                text_content = result.document.export_to_markdown()
             upsert_stage_output(db_path, file_hash, "docling", text_content, None, None)
             
         elif stage == "filtering":
@@ -343,9 +393,28 @@ def process_file(
                 if glossary_path.exists():
                     translation_instructions += f"\n\n# Active Glossary (glossary.md)\n{glossary_path.read_text(encoding='utf-8')}"
                 
+                current_text_to_translate = text_content
                 while True:
-                    translated_text = call_llm(config, translation_instructions, text_content)
+                    response_text = call_llm(config, translation_instructions, current_text_to_translate)
                     
+                    status_line = ""
+                    payload = response_text
+                    if response_text.startswith("RTL_STATUS:"):
+                        lines = response_text.split('\n', 1)
+                        status_line = lines[0].strip()
+                        payload = lines[1].strip() if len(lines) > 1 else ""
+                    
+                    if any(x in status_line for x in ("REVERSED_WORDS", "REVERSED_SENTENCES", "REVERSED_BOTH")):
+                        detected_status = "REVERSED_BOTH" if "REVERSED_BOTH" in status_line else ("REVERSED_WORDS" if "REVERSED_WORDS" in status_line else "REVERSED_SENTENCES")
+                        print(f"    [RTL Status] Detected corruption: {detected_status}. Fixing locally and retrying...")
+                        current_text_to_translate = fix_hebrew_layout(current_text_to_translate, detected_status)
+                        continue
+                    
+                    if "NORMAL" in status_line:
+                        translated_text = payload
+                    else:
+                        translated_text = response_text
+                        
                     if "Clarification Required" in translated_text:
                         print(f"\n    [Clarification Triggered] LLM requested clarification:")
                         print("-" * 60)

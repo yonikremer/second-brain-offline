@@ -67,3 +67,15 @@ Once the user provides the answer, you must execute the following steps in exact
 2.  **Format:** Use the existing Markdown table format in the glossary (`| Hebrew/Internal Term | English Translation | Notes |`).
 3.  **Confirm:** Output a brief confirmation to the user (e.g., *"Added 'פרויקט ארז' -> 'Project Erez' to glossary.md"*).
 4.  **Resume Translation:** Proceed with translating the rest of the document using the newly confirmed term. Do not ask for permission to resume.
+
+## 8. Hebrew RTL Corruption Detection (Pre-Translation Check)
+Before performing translation or asking for clarification, analyze the Hebrew text layout:
+1. **Check for Reversed Characters/Words:** Look for reversed character order within Hebrew words.
+   - *Example:* "בוט רקוב" instead of "בוקר טוב" (even if they are valid words, they are a reversed representation of "בוקר טוב").
+2. **Check for Reversed Sentence Flow:** Look for reversed word order within sentences.
+   - *Example:* "טוב בוקר" instead of "בוקר טוב".
+3. **If corruption is detected:** Stop immediately. Do NOT translate. Respond ONLY with the appropriate tag below and nothing else:
+   - `RTL_STATUS: REVERSED_WORDS`
+   - `RTL_STATUS: REVERSED_SENTENCES`
+   - `RTL_STATUS: REVERSED_BOTH`
+4. **If layout is correct (no corruption):** Start your response with `RTL_STATUS: NORMAL`, followed by a blank line, and then proceed with the English translation as normal.
