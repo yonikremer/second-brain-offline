@@ -2,6 +2,7 @@
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 # Import functions to test
 import process
@@ -195,6 +196,95 @@ class TestCascadeInvalidation(unittest.TestCase):
             self.assertEqual(stages_to_run, ["translation", "subdomain", "doc_type", "truthness"])
         finally:
             process.get_instruction_hash = original_get_hash
+
+class TestInteractiveTranslation(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        # Create directories
+        (self.root / "raw").mkdir()
+        (self.root / "instructions").mkdir()
+        (self.root / "processed_md").mkdir()
+        
+        # Write dummy translation instructions
+        (self.root / "instructions" / "translation.md").write_text("translation rules", encoding="utf-8")
+        (self.root / "instructions" / "subdomains.md").write_text("subdomain rules", encoding="utf-8")
+        (self.root / "instructions" / "document_types.md").write_text("doc type rules", encoding="utf-8")
+        (self.root / "instructions" / "truthness.md").write_text("truthness rules", encoding="utf-8")
+        
+        # Dummy config
+        self.config = {
+            "llm": {
+                "api_base": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "llama3"
+            }
+        }
+        
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        # Clean up glossary.md if created in cwd during testing
+        if Path("glossary.md").exists():
+            Path("glossary.md").unlink()
+
+    @patch("process.call_llm")
+    @patch("process.input")
+    def test_interactive_translation_loop(self, mock_input, mock_call_llm):
+        from unittest.mock import patch, MagicMock
+        
+        # We simulate a file that needs translation
+        raw_file = self.root / "raw" / "doc.txt"
+        raw_file.write_text("שלום", encoding="utf-8") # Hebrew text to trigger needs_translation
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        # Stage 3 first call -> Clarification
+        # Stage 3 second call -> Hello
+        # Stage 4 -> Tech
+        # Stage 5 -> concept
+        # Stage 6 -> {"score": 9, "justification": "trusted"}
+        mock_call_llm.side_effect = [
+            "Clarification Required\nTerm/Issue: שלום\nContext: שלום עולם\nQuestion: How to translate?",
+            "Hello",
+            "Tech",
+            "concept",
+            '{"score": 9, "justification": "trusted"}'
+        ]
+        
+        # User answers the clarification (Translation, Notes)
+        mock_input.side_effect = ["Hello", "Greeting notes"]
+        
+        # Stub the docling converter to return our custom raw text
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום"
+            mock_converter_cls.return_value = mock_conv
+            
+            # Execute pipeline on the file
+            process.process_file(
+                filepath=raw_file,
+                raw_root=self.root / "raw",
+                output_root=self.root / "processed_md",
+                db_path=db_path,
+                config=self.config,
+                force_stage=None
+            )
+            
+        # Verify glossary.md was created in root
+        glossary_path = Path("glossary.md")
+        self.assertTrue(glossary_path.exists())
+        glossary_content = glossary_path.read_text(encoding="utf-8")
+        self.assertIn("שלום", glossary_content)
+        self.assertIn("Hello", glossary_content)
+        
+        # Verify output processed MD file
+        out_file = self.root / "processed_md" / "doc.md"
+        self.assertTrue(out_file.exists())
+        out_content = out_file.read_text(encoding="utf-8")
+        self.assertIn("Hello", out_content)
+        self.assertIn("truthness_score: 9", out_content)
 
 if __name__ == "__main__":
     unittest.main()

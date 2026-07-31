@@ -9,6 +9,7 @@ from pathlib import Path
 # Verify dependencies are present immediately at start
 from docling.document_converter import DocumentConverter
 from openai import OpenAI
+import xml.etree.ElementTree as ET
 
 # Pipeline sequence
 STAGES = ["docling", "filtering", "translation", "subdomain", "doc_type", "truthness"]
@@ -137,7 +138,6 @@ def check_guid_filename_ratio(text: str) -> bool:
 
     def is_valid_xml(s: str) -> bool:
         try:
-            import xml.etree.ElementTree as ET
             ET.fromstring(s)
             return True
         except ET.ParseError:
@@ -339,9 +339,46 @@ def process_file(
                 upsert_stage_output(db_path, file_hash, "translation", text_content, current_model, current_instr_hash)
             else:
                 translation_instructions = instr_path.read_text(encoding="utf-8")
-                translated_text = call_llm(config, translation_instructions, text_content)
-                text_content = translated_text
-                upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash)
+                glossary_path = Path("glossary.md")
+                if glossary_path.exists():
+                    translation_instructions += f"\n\n# Active Glossary (glossary.md)\n{glossary_path.read_text(encoding='utf-8')}"
+                
+                while True:
+                    translated_text = call_llm(config, translation_instructions, text_content)
+                    
+                    if "Clarification Required" in translated_text:
+                        print(f"\n    [Clarification Triggered] LLM requested clarification:")
+                        print("-" * 60)
+                        print(translated_text)
+                        print("-" * 60)
+                        
+                        term_match = re.search(r"Term/Issue:\s*(.*)", translated_text)
+                        term_to_clarify = term_match.group(1).strip() if term_match else "unknown term"
+                        
+                        print(f"Please provide translation for: '{term_to_clarify}'")
+                        user_answer = input("Translation: ").strip()
+                        user_notes = input("Context/Notes (optional): ").strip()
+                        
+                        # Write glossary entry
+                        if not glossary_path.exists():
+                            glossary_path.write_text(
+                                "# Glossary\n\n| Hebrew/Internal Term | English Translation | Notes |\n|---|---|---|\n",
+                                encoding="utf-8"
+                            )
+                        
+                        existing_glossary = glossary_path.read_text(encoding="utf-8").rstrip()
+                        new_row = f"| {term_to_clarify} | {user_answer} | {user_notes} |\n"
+                        glossary_path.write_text(existing_glossary + "\n" + new_row, encoding="utf-8")
+                        print(f"    [Glossary] Added '{term_to_clarify}' -> '{user_answer}' to glossary.md")
+                        
+                        # Rebuild instructions and loop
+                        translation_instructions = instr_path.read_text(encoding="utf-8")
+                        translation_instructions += f"\n\n# Active Glossary (glossary.md)\n{glossary_path.read_text(encoding='utf-8')}"
+                        continue
+                    else:
+                        text_content = translated_text
+                        upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash)
+                        break
                 
         elif stage == "subdomain":
             # Consume translation output
