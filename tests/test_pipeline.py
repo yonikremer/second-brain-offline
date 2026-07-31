@@ -47,6 +47,16 @@ class TestPipelineLogic(unittest.TestCase):
         text = '```xml\n<root><element>data</element></root>\n```'
         self.assertTrue(process.check_guid_filename_ratio(text))
 
+    def test_check_guid_filename_ratio_hex(self):
+        # Mostly hex characters (spaces ignored)
+        text = "4a 5f 6c 7d 8e 99 aa bb cc dd ee ff"
+        self.assertTrue(process.check_guid_filename_ratio(text))
+
+    def test_check_guid_filename_ratio_bits(self):
+        # Mostly bits (spaces ignored)
+        text = "01010101 11001100 00001111 11110000"
+        self.assertTrue(process.check_guid_filename_ratio(text))
+
     def test_needs_translation_hebrew(self):
         # Contains Hebrew words
         text = "שלום עולם! This is some English text." # 'שלום עולם' has 8 Hebrew letters. Total letters is 8 + 21 = 29. Ratio = 8/29 = 27% (>= 1%).

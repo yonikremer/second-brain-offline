@@ -154,6 +154,13 @@ def check_guid_filename_ratio(text: str) -> bool:
             if is_valid_json(stripped) or is_valid_xml(stripped):
                 return True
 
+    # Check if content is mostly hex or bits (ignore spaces and newlines)
+    no_ws = "".join(text.split())
+    if no_ws:
+        hex_count = len(re.findall(r"[0-9a-fA-F]", no_ws))
+        if (hex_count / len(no_ws)) >= 0.80:
+            return True
+
     guid_pattern = re.compile(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b")
     filename_pattern = re.compile(r"\b[\w\-]+\.(?:pdf|docx|doc|txt|md|html|png|jpg|jpeg|zip|json|yml|yaml|csv|xml|xls|xlsx|wav|32fc|16c|32f|one)\b")
     
