@@ -5,6 +5,10 @@ import subprocess
 import sqlite3
 from pathlib import Path
 
+import email
+from email import policy
+import extract_msg
+
 # Import helper functions and DB helpers
 from db import (
     NeedsReviewException,
@@ -63,6 +67,46 @@ def run_docling_stage(filepath: Path, db_path: Path, file_hash: str, config: dic
         finally:
             if temp_docx.exists():
                 temp_docx.unlink()
+    elif filepath.suffix.lower() in (".eml", ".msg"):
+        text_content = ""
+        if filepath.suffix.lower() == ".eml":
+            try:
+                with open(filepath, 'rb') as f:
+                    msg = email.message_from_binary_file(f, policy=policy.default)
+                subject = msg.get('subject', '')
+                if subject:
+                    subject = re.sub(r'\b[fF][wW]\b', 'forward', subject)
+                sender = msg.get('from', '')
+                to = msg.get('to', '')
+                date = msg.get('date', '')
+                
+                body = ""
+                body_part = msg.get_body(preferencelist=('plain', 'html'))
+                if body_part:
+                    body = body_part.get_content()
+                
+                text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n\n{body}"
+            except Exception as e:
+                print(f"    [Email] Warning: Failed to parse .eml file {filepath.name}: {e}")
+                converter = converter_cls()
+                result = converter.convert(str(filepath))
+                text_content = result.document.export_to_markdown()
+        else: # .msg
+            try:
+                with extract_msg.openMsg(str(filepath)) as msg:
+                    subject = msg.subject or ""
+                    if subject:
+                        subject = re.sub(r'\b[fF][wW]\b', 'forward', subject)
+                    sender = msg.sender or ""
+                    to = msg.to or ""
+                    date = msg.date or ""
+                    body = msg.body or ""
+                    text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n\n{body}"
+            except Exception as e:
+                print(f"    [Email] Warning: Failed to parse .msg file {filepath.name}: {e}")
+                converter = converter_cls()
+                result = converter.convert(str(filepath))
+                text_content = result.document.export_to_markdown()
     else:
         converter = converter_cls()
         result = converter.convert(str(filepath))
