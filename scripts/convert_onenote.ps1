@@ -26,8 +26,18 @@ try {
     $OneNote.Publish($SectionId, $docxAbsPath, 5, "")
     
     Write-Host "Export successful!"
+    if ($OneNote) {
+        $OneNote.Quit()
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($OneNote) | Out-Null
+    }
     exit 0
 } catch {
+    if ($OneNote) {
+        try {
+            $OneNote.Quit()
+        } catch {}
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($OneNote) | Out-Null
+    }
     Write-Error $_
     exit 1
 }
