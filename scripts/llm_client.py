@@ -4,12 +4,23 @@ import sys
 import time
 from openai import OpenAI
 
+_client_instance = None
+_client_key = None
+
+def get_openai_client(api_base: str, api_key: str) -> OpenAI:
+    global _client_instance, _client_key
+    current_key = (api_base, api_key)
+    if _client_instance is None or _client_key != current_key:
+        _client_instance = OpenAI(base_url=api_base, api_key=api_key, timeout=60.0)
+        _client_key = current_key
+    return _client_instance
+
 def call_llm(config: dict, system_prompt: str, user_prompt: str) -> str:
     api_base = config["llm"]["api_base"]
     api_key = config["llm"]["api_key"]
     model = config["llm"]["model"]
     
-    client = OpenAI(base_url=api_base, api_key=api_key)
+    client = get_openai_client(api_base, api_key)
     
     max_retries = 5
     backoff_factor = 2.0
