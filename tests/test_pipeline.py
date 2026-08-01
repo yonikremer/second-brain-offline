@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 # Import functions to test
+import sys
+sys.path.append(str(Path(__file__).parent.parent / "scripts"))
 import process
 
 class TestPipelineLogic(unittest.TestCase):
@@ -393,6 +395,7 @@ class TestOneNoteConversion(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    @patch("sys.platform", "win32")
     @patch("subprocess.run")
     @patch("process.DocumentConverter")
     @patch("process.call_llm")
@@ -441,6 +444,7 @@ class TestOneNoteConversion(unittest.TestCase):
         self.assertTrue(cmd[4].endswith("convert_onenote.ps1"))
         self.assertEqual(cmd[5], "-OnePath")
         self.assertEqual(cmd[7], "-DocxPath")
+        self.assertEqual(kwargs.get("timeout"), 300)
         
         # Verify output markdown was created
         out_file = self.root / "processed_md" / "notes.md"
@@ -448,6 +452,62 @@ class TestOneNoteConversion(unittest.TestCase):
         out_content = out_file.read_text(encoding="utf-8")
         self.assertIn("Converted Markdown content", out_content)
         self.assertIn("truthness_score: 10", out_content)
+
+    @patch("sys.platform", "win32")
+    @patch("subprocess.run")
+    @patch("process.DocumentConverter")
+    def test_onenote_skip_config(self, mock_docling, mock_run):
+        raw_file = self.root / "raw" / "notes.one"
+        raw_file.write_text("dummy", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        config_with_skip = {
+            "llm": self.config["llm"],
+            "docling": {
+                "skip_onenote": True
+            }
+        }
+        
+        process.process_file(
+            filepath=raw_file,
+            raw_root=self.root / "raw",
+            output_root=self.root / "processed_md",
+            db_path=db_path,
+            config=config_with_skip,
+            force_stage=None
+        )
+        
+        mock_run.assert_not_called()
+        # Check status in db is 'skipped'
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM files WHERE filepath = ?", (str(raw_file),))
+        row = cursor.fetchone()
+        self.assertEqual(row[0], "skipped")
+        conn.close()
+
+    @patch("sys.platform", "linux")
+    @patch("subprocess.run")
+    def test_onenote_non_windows_raises_error(self, mock_run):
+        raw_file = self.root / "raw" / "notes.one"
+        raw_file.write_text("dummy", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        with self.assertRaises(RuntimeError) as ctx:
+            process.process_file(
+                filepath=raw_file,
+                raw_root=self.root / "raw",
+                output_root=self.root / "processed_md",
+                db_path=db_path,
+                config=self.config,
+                force_stage=None
+            )
+        self.assertIn("only supported on Windows", str(ctx.exception))
 
 class TestCategoryVerification(unittest.TestCase):
     def setUp(self):
@@ -642,7 +702,197 @@ class TestHumanReviewQueueFlow(unittest.TestCase):
         self.assertTrue(out_file.exists())
         out_content = out_file.read_text(encoding="utf-8")
         self.assertIn("truthness_score: 5", out_content)
-        self.assertIn("truthness_justification: \"overriding unreliable source\"", out_content)
+        self.assertIn("truthness_justification: overriding unreliable source", out_content)
+
+class TestNewRegressionTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        (self.root / "raw").mkdir()
+        (self.root / "instructions").mkdir()
+        (self.root / "processed_md").mkdir()
+        
+        self.subdomains_file = self.root / "instructions" / "subdomains.md"
+        self.subdomains_file.write_text("# Subdomains\n\n## Allowed Subdomains\n\n1. **Tech**\n   - Tech topics\n2. **other**\n   - Other topics\n", encoding="utf-8")
+        
+        (self.root / "instructions" / "translation.md").write_text("translation rules", encoding="utf-8")
+        (self.root / "instructions" / "document_types.md").write_text("# Doc Types\n\n## Allowed Document Types\n\n1. **concept**\n   - concept\n", encoding="utf-8")
+        (self.root / "instructions" / "truthness.md").write_text("truthness rules", encoding="utf-8")
+        
+        self.orig_instructions = process.STAGE_INSTRUCTIONS.copy()
+        process.STAGE_INSTRUCTIONS["translation"] = self.root / "instructions" / "translation.md"
+        process.STAGE_INSTRUCTIONS["subdomain"] = self.root / "instructions" / "subdomains.md"
+        process.STAGE_INSTRUCTIONS["doc_type"] = self.root / "instructions" / "document_types.md"
+        process.STAGE_INSTRUCTIONS["truthness"] = self.root / "instructions" / "truthness.md"
+        
+        self.config = {
+            "llm": {
+                "api_base": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "llama3"
+            },
+            "truthness": {
+                "threshold": 4
+            }
+        }
+        
+        self.review_dir = Path("review")
+        if self.review_dir.exists():
+            for f in self.review_dir.glob("*"):
+                if f.is_file():
+                    f.unlink()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        process.STAGE_INSTRUCTIONS = self.orig_instructions
+        if self.review_dir.exists():
+            for f in self.review_dir.glob("*"):
+                if f.is_file():
+                    f.unlink()
+            try:
+                self.review_dir.rmdir()
+            except OSError:
+                pass
+        if Path("glossary.md").exists():
+            Path("glossary.md").unlink()
+
+    @patch("sys.platform", "win32")
+    @patch("process.call_llm")
+    def test_hash_change_invalidation_and_stale_review_cleanup(self, mock_call_llm):
+        import sqlite3
+        import yaml
+        from unittest.mock import MagicMock
+        
+        raw_file = self.root / "raw" / "doc.txt"
+        raw_file.write_text("שלום עולם הישן", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        # First run triggers low score review
+        mock_call_llm.side_effect = [
+            "Translated text old",
+            "Tech",
+            "concept",
+            '{"score": 2, "justification": "unreliable old"}'
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום עולם הישן"
+            mock_converter_cls.return_value = mock_conv
+            
+            with self.assertRaises(process.NeedsReviewException):
+                process.process_file(raw_file, self.root / "raw", self.root / "processed_md", db_path, self.config, None)
+        
+        # Verify we have 1 pending review in database and 1 review file
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, file_hash FROM review_queue WHERE stage='truthness'")
+        row = cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "pending")
+        old_hash = row[1]
+        conn.close()
+        
+        review_files = list(self.review_dir.glob("*.md"))
+        self.assertEqual(len(review_files), 1)
+        
+        # Now change content of raw file
+        raw_file.write_text("שלום עולם החדש", encoding="utf-8")
+        
+        # Run processing again
+        # It should detect hash change, mark old review as stale, delete review file, and run stages again.
+        mock_call_llm.side_effect = [
+            "Translated text new",
+            "Tech",
+            "concept",
+            '{"score": 2, "justification": "unreliable new"}'
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום עולם החדש"
+            mock_converter_cls.return_value = mock_conv
+            
+            with self.assertRaises(process.NeedsReviewException):
+                process.process_file(raw_file, self.root / "raw", self.root / "processed_md", db_path, self.config, None)
+        
+        # Verify old review status is now stale in db
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM review_queue WHERE file_hash=?", (old_hash,))
+        row = cursor.fetchone()
+        self.assertEqual(row[0], "stale")
+        conn.close()
+        
+        # Verify review files for old hash are deleted
+        review_files = list(self.review_dir.glob("*.md"))
+        self.assertEqual(len(review_files), 1)
+
+    @patch("sys.platform", "win32")
+    @patch("process.call_llm")
+    def test_yaml_safe_frontmatter_special_characters(self, mock_call_llm):
+        import yaml
+        from unittest.mock import MagicMock
+        
+        raw_file = self.root / "raw" / "doc.txt"
+        raw_file.write_text("שלום עולם", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        # truthness return justification with newlines and quotes
+        special_just = "Line1\nLine2\n\"quoted text\"\n\\backslash\\"
+        mock_call_llm.side_effect = [
+            "Plain English text",
+            "Tech",
+            "concept",
+            json.dumps({"score": 9, "justification": special_just})
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום עולם"
+            mock_converter_cls.return_value = mock_conv
+            
+            process.process_file(raw_file, self.root / "raw", self.root / "processed_md", db_path, self.config, None)
+        
+        out_file = self.root / "processed_md" / "doc.md"
+        self.assertTrue(out_file.exists())
+        
+        out_content = out_file.read_text(encoding="utf-8")
+        parts = out_content.split("---")
+        self.assertTrue(len(parts) >= 3)
+        fm_data = yaml.safe_load(parts[1])
+        self.assertEqual(fm_data["truthness_justification"], special_just)
+
+    def test_glossary_parsing_and_filtering(self):
+        glossary_file = self.root / "glossary.md"
+        glossary_file.write_text(
+            "# Glossary\n\n| Hebrew/Internal Term | English Translation | Notes |\n|---|---|---|\n| מפתח | Key | a crypto key |\n| מנעול | Lock | physical lock |\n",
+            encoding="utf-8"
+        )
+        
+        entries = process.load_glossary_entries(glossary_file)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0], ("מפתח", "Key", "a crypto key"))
+        self.assertEqual(entries[1], ("מנעול", "Lock", "physical lock"))
+        
+        # Filter check
+        text = "This text only contains the word מפתח but not the other one."
+        filtered = process.filter_glossary_entries(entries, text)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][0], "מפתח")
+
+    def test_check_guid_filename_ratio_custom_threshold(self):
+        text = "54a06457-1820-49fe-8e1b-30fe482938a0 my-photo.png plaintexxx" # ratio around 82.7%
+        # Under custom threshold 0.90, it should return False
+        self.assertFalse(process.check_guid_filename_ratio(text, 0.90))
+        # Under custom threshold 0.70, it should return True
+        self.assertTrue(process.check_guid_filename_ratio(text, 0.70))
 
 if __name__ == "__main__":
     unittest.main()
+

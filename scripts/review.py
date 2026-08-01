@@ -6,8 +6,9 @@ import sys
 from pathlib import Path
 import yaml
 
-# Ensure project root is in path
+# Ensure project root and scripts folder are in path
 sys.path.append(str(Path.cwd()))
+sys.path.append(str(Path.cwd() / "scripts"))
 
 from process import (
     process_file,
