@@ -199,6 +199,47 @@ def check_coverage(raw_files: list[Path], file_statuses: dict[str, dict]) -> dic
     }
 
 
+def check_review_queue(db_path: Path, total_files: int, high_rate_threshold: float = 0.25) -> dict[str, Any]:
+    conn = _db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT stage, trigger_type, status FROM review_queue")
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    pending = [r for r in rows if r["status"] == "pending"]
+    stale = [r for r in rows if r["status"] == "stale"]
+    by_trigger = Counter((r["stage"], r["trigger_type"]) for r in pending)
+    review_rate = len(pending) / total_files if total_files else 0.0
+    high_triggers = [
+        {"stage": s, "trigger": t, "count": c}
+        for (s, t), c in by_trigger.items()
+        if c / total_files > high_rate_threshold
+    ] if total_files else []
+
+    return {
+        "name": "Review queue signal",
+        "ok": review_rate <= high_rate_threshold,
+        "critical": False,
+        "details": {
+            "pending_count": len(pending),
+            "stale_count": len(stale),
+            "review_rate": review_rate,
+            "by_trigger": dict(by_trigger),
+            "high_triggers": high_triggers,
+        },
+    }
+
+
+def sample_files(processed_paths: list[Path], sample_size: int, seed: int | None = None) -> list[Path]:
+    if seed is not None:
+        random.seed(seed)
+    if len(processed_paths) <= sample_size:
+        return processed_paths
+    return random.sample(processed_paths, sample_size)
+
+
 def main():
     pass
 

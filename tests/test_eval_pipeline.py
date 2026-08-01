@@ -210,10 +210,45 @@ class TestReviewQueueAndSampling(unittest.TestCase):
 
     def test_review_queue_summary(self):
         result = ep.check_review_queue(self.db_path, total_files=10)
-        self.assertFalse(result["ok"])
+        # 2 pending / 10 total = 0.2 <= 0.25 threshold → ok
+        self.assertTrue(result["ok"])
         self.assertEqual(result["details"]["pending_count"], 2)
         self.assertEqual(result["details"]["stale_count"], 1)
         self.assertAlmostEqual(result["details"]["review_rate"], 0.2)
+
+    def test_review_queue_above_threshold_fails(self):
+        # Override test data: 4 pending out of 10 total → rate 0.4 > 0.25
+        db_path = Path(self.tmp.name) / "pipeline2.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE review_queue (
+                id INTEGER PRIMARY KEY,
+                file_hash TEXT,
+                filepath TEXT,
+                stage TEXT,
+                trigger_type TEXT,
+                context_json TEXT,
+                proposed_answer TEXT,
+                human_answer TEXT,
+                status TEXT,
+                resolution_note TEXT
+            );
+        """)
+        conn.executemany(
+            "INSERT INTO review_queue (file_hash, filepath, stage, trigger_type, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("h1", "/vault/raw/a.txt", "translation", "clarification", "pending"),
+                ("h2", "/vault/raw/b.txt", "truthness", "low_score", "pending"),
+                ("h3", "/vault/raw/c.txt", "subdomain", "new_category", "pending"),
+                ("h4", "/vault/raw/d.txt", "doc_type", "new_category", "pending"),
+                ("h5", "/vault/raw/e.txt", "translation", "clarification", "stale"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        result = ep.check_review_queue(db_path, total_files=10)
+        self.assertFalse(result["ok"])
+        self.assertAlmostEqual(result["details"]["review_rate"], 0.4)
 
     def test_sample_files(self):
         processed = [Path(f"/vault/raw/f{i}.txt") for i in range(3)]
