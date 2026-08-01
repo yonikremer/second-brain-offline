@@ -85,7 +85,21 @@ def run_docling_stage(filepath: Path, db_path: Path, file_hash: str, config: dic
                 if body_part:
                     body = body_part.get_content()
                 
-                text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n\n{body}"
+                attachments_list = []
+                for part in msg.walk():
+                    if part.get_content_disposition() == 'attachment':
+                        filename = part.get_filename()
+                        if filename:
+                            file_data = part.get_payload(decode=True)
+                            dest_dir = filepath.parent / f"{filepath.stem}_attachments"
+                            dest_dir.mkdir(exist_ok=True)
+                            att_path = dest_dir / filename
+                            att_path.write_bytes(file_data)
+                            attachments_list.append(filename)
+                            print(f"    [Email] Extracted attachment: {filename}")
+                            
+                att_str = f"Attachments: {', '.join(attachments_list)}\n" if attachments_list else ""
+                text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n{att_str}\n{body}"
             except Exception as e:
                 print(f"    [Email] Warning: Failed to parse .eml file {filepath.name}: {e}")
                 converter = converter_cls()
@@ -101,7 +115,29 @@ def run_docling_stage(filepath: Path, db_path: Path, file_hash: str, config: dic
                     to = msg.to or ""
                     date = msg.date or ""
                     body = msg.body or ""
-                    text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n\n{body}"
+                    
+                    attachments_list = []
+                    for att in msg.attachments:
+                        dest_dir = filepath.parent / f"{filepath.stem}_attachments"
+                        dest_dir.mkdir(exist_ok=True)
+                        try:
+                            att.save(customPath=str(dest_dir))
+                            filename = att.filename or att.longFilename
+                            if filename:
+                                attachments_list.append(filename)
+                                print(f"    [Email] Extracted attachment: {filename}")
+                        except Exception:
+                            filename = att.filename or att.longFilename
+                            if filename:
+                                try:
+                                    (dest_dir / filename).write_bytes(att.data)
+                                    attachments_list.append(filename)
+                                    print(f"    [Email] Extracted attachment: {filename}")
+                                except Exception:
+                                    pass
+                                    
+                    att_str = f"Attachments: {', '.join(attachments_list)}\n" if attachments_list else ""
+                    text_content = f"Subject: {subject}\nFrom: {sender}\nTo: {to}\nDate: {date}\n{att_str}\n{body}"
             except Exception as e:
                 print(f"    [Email] Warning: Failed to parse .msg file {filepath.name}: {e}")
                 converter = converter_cls()
