@@ -215,7 +215,7 @@ def process_file(
 ):
     should_close = conn is None
     if conn is None:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
     try:
         rel_path = filepath.relative_to(raw_root) if filepath.is_relative_to(raw_root) else Path(filepath.name)
         print(f"\n>>> Processing: {rel_path}")
@@ -336,7 +336,7 @@ def main():
     
     if workers > 1:
         def run_one(fpath):
-            conn = sqlite3.connect(str(db_path))
+            conn = sqlite3.connect(str(db_path), timeout=30.0)
             try:
                 process_file(fpath, raw_root, output_root, db_path, config, force_stage, conn=conn)
                 return "success", fpath, None
@@ -370,7 +370,7 @@ def main():
                     print(f"    [Error] Future raised exception for {fpath}: {e}", file=sys.stderr)
                     error_count += 1
     else:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
         try:
             for fpath in files_to_process:
                 try:
