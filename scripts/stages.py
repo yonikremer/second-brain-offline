@@ -43,6 +43,27 @@ def run_docling_stage(filepath: Path, db_path: Path, file_hash: str, config: dic
             print(f"    [OneNote] Config option 'skip_onenote' is enabled. Skipping {filepath.name}.")
             upsert_file_status(db_path, str(filepath), file_hash, "skipped", conn=conn)
             return None
+            
+        if not hasattr(run_docling_stage, "_onenote_available"):
+            print("    [OneNote] Checking Microsoft OneNote COM registry registration...")
+            try:
+                import winreg
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "OneNote.Application")
+                    winreg.CloseKey(key)
+                    run_docling_stage._onenote_available = True
+                except OSError:
+                    run_docling_stage._onenote_available = False
+            except Exception:
+                run_docling_stage._onenote_available = (sys.platform == "win32")
+            
+            if not run_docling_stage._onenote_available:
+                print("    [OneNote] Warning: Microsoft OneNote COM interface is not registered on this system. OneNote files will be skipped.")
+                
+        if not getattr(run_docling_stage, "_onenote_available", False):
+            print(f"    [OneNote] Skipping {filepath.name} because OneNote is not available.")
+            upsert_file_status(db_path, str(filepath), file_hash, "skipped", conn=conn)
+            return None
         
         print("    [OneNote] Converting .one file to temporary .docx via PowerShell COM...")
         temp_docx = filepath.with_suffix(".temp.docx")
