@@ -21,7 +21,7 @@ DEFAULT_WHITELIST = {
     # one note
     ".one", ".onetoc2",
     # mails
-    ".eml", ".msg", ".pst", ".ost", ".mbox"
+    ".eml", ".msg"
 }
 
 DEFAULT_BLACKLIST = {
@@ -56,7 +56,7 @@ def clean_extensions(ext_list: list[str] | None) -> set[str]:
     return cleaned
 
 
-def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path, dry_run: bool) -> Path | None:
+def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path, dry_run: bool, existing_names: set[str] = None) -> Path | None:
     """
     Copies a file to the destination directory.
     If preserve_structure is True, recreates the source relative directory path inside dest.
@@ -70,20 +70,34 @@ def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path
             # Fallback in case src is not under source_root
             target_path = dest / src.name
     else:
-        target_path = dest / src.name
-
-    # Handle collisions for flat copy
-    if not preserve_structure and target_path.exists():
-        base = target_path.stem
-        suffix = target_path.suffix
-        counter = 1
-        while True:
-            new_name = f"{base}_{counter}{suffix}"
-            candidate = dest / new_name
-            if not candidate.exists():
-                target_path = candidate
-                break
-            counter += 1
+        target_name = src.name
+        if existing_names is not None:
+            if target_name.lower() in existing_names:
+                base = src.stem
+                suffix = src.suffix
+                counter = 1
+                while True:
+                    new_name = f"{base}_{counter}{suffix}"
+                    if new_name.lower() not in existing_names:
+                        target_name = new_name
+                        break
+                    counter += 1
+            existing_names.add(target_name.lower())
+        else:
+            target_path = dest / target_name
+            if target_path.exists():
+                base = target_path.stem
+                suffix = target_path.suffix
+                counter = 1
+                while True:
+                    new_name = f"{base}_{counter}{suffix}"
+                    candidate = dest / new_name
+                    if not candidate.exists():
+                        target_path = candidate
+                        break
+                    counter += 1
+                target_name = target_path.name
+        target_path = dest / target_name
 
     if dry_run:
         logging.info(f"[DRY-RUN] Copy {src} -> {target_path}")
@@ -119,8 +133,18 @@ def traverse_and_copy(
     source_resolved = source.resolve()
     dest_resolved = dest.resolve()
 
+    existing_names = set()
+    if not preserve_structure and dest_resolved.exists():
+        try:
+            existing_names = {p.name.lower() for p in dest_resolved.iterdir() if p.is_file()}
+        except Exception as e:
+            logging.warning(f"Could not read destination directory for collision cache: {e}")
+
+    def on_walk_error(err):
+        logging.warning(f"Error accessing path during walk: {err}")
+
     # Use os.walk and handle permission/access errors gracefully
-    for root, dirs, files in os.walk(source_resolved):
+    for root, dirs, files in os.walk(source_resolved, onerror=on_walk_error):
         # Prevent traversing into the destination directory if it is inside the source directory
         if Path(root).resolve() == dest_resolved:
             logging.debug(f"Skipping traversal of destination folder: {root}")
@@ -138,7 +162,8 @@ def traverse_and_copy(
                     dest=dest_resolved,
                     preserve_structure=preserve_structure,
                     source_root=source_resolved,
-                    dry_run=dry_run
+                    dry_run=dry_run,
+                    existing_names=existing_names
                 )
                 if copied:
                     copied_count += 1
