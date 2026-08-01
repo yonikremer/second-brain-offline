@@ -1,8 +1,16 @@
-import re
 import json
+import re
+import sqlite3
 import xml.etree.ElementTree as ET
 import hashlib
 from pathlib import Path
+
+
+def db_conn(db_path: Path) -> sqlite3.Connection:
+    """Return a connection with row_factory set to sqlite3.Row."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def compute_file_hash(filepath: Path) -> str:
     hasher = hashlib.sha256()

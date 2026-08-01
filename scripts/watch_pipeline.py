@@ -1,23 +1,17 @@
 import argparse
-import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from helpers import db_conn
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
 
-def _db_conn(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def get_summary(db_path: Path) -> dict:
-    conn = _db_conn(db_path)
+    conn = db_conn(db_path)
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT status, COUNT(*) AS cnt FROM files GROUP BY status")
@@ -48,7 +42,15 @@ def get_summary(db_path: Path) -> dict:
     }
 
 
-def render_table(summary: dict, elapsed: timedelta) -> Table:
+def _format_remaining(remaining: int, rate_per_sec: float) -> str:
+    if rate_per_sec <= 0 or remaining <= 0:
+        return "?"
+    seconds = int(remaining / rate_per_sec)
+    td = timedelta(seconds=seconds)
+    return str(td).split(".")[0]
+
+
+def render_table(summary: dict, elapsed: timedelta, eta_str: str | None) -> Table:
     table = Table(title="Pipeline Watch")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="magenta")
@@ -66,17 +68,30 @@ def render_table(summary: dict, elapsed: timedelta) -> Table:
     if summary["done"] and summary["total"]:
         rate = summary["done"] / summary["total"]
         table.add_row("Progress", f"{rate:.1%}")
+    if eta_str is not None:
+        table.add_row("ETA", eta_str)
     return table
 
 
 def watch(db_path: Path, interval: int = 5):
     console = Console()
     start = datetime.now()
+    last_done = 0
+    last_time = start
     with Live(console=console, refresh_per_second=1) as live:
         while True:
             summary = get_summary(db_path)
-            elapsed = datetime.now() - start
-            live.update(render_table(summary, elapsed))
+            now = datetime.now()
+            elapsed = now - start
+            rate = 0.0
+            if summary["done"] > last_done and (now - last_time).total_seconds() > 0:
+                secs = (now - last_time).total_seconds()
+                rate = (summary["done"] - last_done) / secs
+            last_done = summary["done"]
+            last_time = now
+            remaining = summary["total"] - summary["done"]
+            eta_str = _format_remaining(remaining, rate) if remaining > 0 else None
+            live.update(render_table(summary, elapsed, eta_str))
             if summary["pending"] == 0 and summary["total"] > 0:
                 console.print("\n[green]All files reached a terminal state.[/green]")
                 break

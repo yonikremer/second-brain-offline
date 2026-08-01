@@ -1,7 +1,5 @@
 import argparse
-import hashlib
 import random
-import sqlite3
 import sys
 from collections import Counter
 from datetime import datetime
@@ -9,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from helpers import compute_file_hash, parse_allowed_values
+from helpers import compute_file_hash, db_conn, parse_allowed_values
 
 
 REQUIRED_FRONTMATTER_KEYS = [
@@ -85,6 +83,22 @@ def check_processed_file(
     return result
 
 
+def _is_critical_error(error: str) -> bool:
+    """Return True if this error represents a hard failure (vs a soft warning)."""
+    critical_keywords = (
+        "not found:",  # missing output or original_path
+        "Missing or malformed YAML frontmatter",
+        "Missing frontmatter key:",
+        "Unknown subdomain:",
+        "Unknown document_type:",
+        "Invalid truthness_score:",
+        "mismatch",
+        "Raw path is not under raw_root",
+    )
+    lower = error.lower()
+    return any(kw.lower() in lower for kw in critical_keywords)
+
+
 def check_output_health(
     raw_root: Path,
     processed_md_root: Path,
@@ -128,10 +142,14 @@ def check_output_health(
     ]
     warnings = [f"{c['path']}: {w}" for c in checked for w in c["warnings"]]
 
+    # A check is 'critical' only when there are hard failures; pure content
+    # warnings (e.g. empty body) do NOT escalate to exit code 1.
+    has_critical = any(_is_critical_error(e) for e in errors)
+
     return {
         "name": "Output health",
         "ok": not errors,
-        "critical": True,
+        "critical": has_critical,
         "details": {
             "processed_count": len(processed_paths),
             "missing_outputs": missing_outputs,
@@ -145,12 +163,6 @@ def check_output_health(
 TERMINAL_STATUSES = {"processed", "filtered", "error", "needs_review", "skipped"}
 
 
-def _db_conn(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def get_raw_files(raw_root: Path) -> list[Path]:
     files = []
     for p in raw_root.rglob("*"):
@@ -160,7 +172,7 @@ def get_raw_files(raw_root: Path) -> list[Path]:
 
 
 def get_file_statuses(db_path: Path) -> dict[str, dict]:
-    conn = _db_conn(db_path)
+    conn = db_conn(db_path)
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT filepath, file_hash, status, error_message FROM files")
@@ -200,7 +212,7 @@ def check_coverage(raw_files: list[Path], file_statuses: dict[str, dict]) -> dic
 
 
 def check_review_queue(db_path: Path, total_files: int, high_rate_threshold: float = 0.25) -> dict[str, Any]:
-    conn = _db_conn(db_path)
+    conn = db_conn(db_path)
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT stage, trigger_type, status FROM review_queue")
@@ -241,7 +253,7 @@ def sample_files(processed_paths: list[Path], sample_size: int, seed: int | None
 
 
 def get_file_hash(db_path: Path, filepath: Path) -> str | None:
-    conn = _db_conn(db_path)
+    conn = db_conn(db_path)
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT file_hash FROM files WHERE filepath = ?", (str(filepath),))
@@ -252,7 +264,7 @@ def get_file_hash(db_path: Path, filepath: Path) -> str | None:
 
 
 def get_stage_outputs(db_path: Path, file_hash: str) -> dict[str, dict]:
-    conn = _db_conn(db_path)
+    conn = db_conn(db_path)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -317,24 +329,57 @@ def build_report(
     )
     review_queue = check_review_queue(db_path, total_files=len(raw_files))
 
-    processed_paths = [
-        Path(fp) for fp, info in statuses.items() if info.get("status") == "processed"
-    ]
-    samples = sample_files(processed_paths, sample_size, seed=seed)
+    # Build sample set: all error/needs_review files + random subset of processed
+    error_paths = [Path(fp) for fp, info in statuses.items()
+                   if info.get("status") in ("error", "needs_review")]
+    processed_paths = [Path(fp) for fp, info in statuses.items()
+                       if info.get("status") == "processed"]
+
+    forced_samples = list(error_paths)
+    random_count = max(0, sample_size - len(forced_samples))
+    random_sample = sample_files(processed_paths, random_count, seed=seed) if random_count else []
+    sample_set = sorted(set(p.as_posix() for p in forced_samples)
+                        | set(p.as_posix() for p in random_sample), key=str)
+
+    # Convert posix strings back to Path objects for forensics lookup
+    sample_paths = [Path(p) for p in sample_set]
     forensics = [
         build_forensics(p, db_path, raw_root, processed_md_root, review_dir)
-        for p in samples
+        for p in sample_paths
     ]
+    # Index forensics by rel_path for anchor lookups
+    forensics_by_rel = {f["rel_path"]: f for f in forensics}
 
     checks = [coverage, output_health, review_queue]
     critical_failures = sum(1 for c in checks if c.get("critical") and not c["ok"])
-    warnings = sum(1 for c in checks if not c.get("critical") and not c["ok"])
+    warning_checks = sum(1 for c in checks if not c.get("critical") and not c["ok"])
+
+    # Build sample entries keyed by rel_path for cross-reference with forensics
+    sample_entries = {}
+    for p in sample_paths:
+        entry_raw = build_forensics(p, db_path, raw_root, processed_md_root, review_dir)
+        sample_entries[entry_raw["rel_path"]] = {
+            "raw": str(p),
+            "processed_path": entry_raw["processed_path"],
+            "db_hash": entry_raw.get("db_hash"),
+        }
+    samples_list = list(sample_entries.values())
+
+    # Build sample entries from forensics data (no duplicate DB calls)
+    samples_list = []
+    for f in forensics:
+        samples_list.append({
+            "raw": f["raw_path"],
+            "processed_path": f["processed_path"],
+            "rel_path": f["rel_path"],
+            "db_hash": f.get("db_hash"),
+        })
 
     return {
         "summary": {
             "total": len(raw_files),
             "critical_failures": critical_failures,
-            "warnings": warnings,
+            "warnings": warning_checks,
             "review_rate": review_queue["details"]["review_rate"],
             "status_counts": _status_table(statuses),
         },
@@ -346,7 +391,7 @@ def build_report(
             {"stage": s, "trigger": t, "count": count}
             for (s, t), count in review_queue["details"]["by_trigger"].items()
         ],
-        "samples": [{"raw": str(s)} for s in samples],
+        "samples": samples_list,
         "forensics": forensics,
     }
 
@@ -401,9 +446,12 @@ def write_report(report: dict, out_path: Path) -> None:
     lines.append("## Sample spot-check\n\n")
     if report["samples"]:
         for item in report["samples"]:
-            lines.append(f"- `{item['raw']}`\n")
+            status = ""
+            if item.get("db_hash"):
+                status = f" (score: {item.get('db_hash', '')[:8]}...)"
+            lines.append(f"- `{item['raw']}` → `{item['processed_path']}`{status}\n")
     else:
-        lines.append("No processed files to sample.\n")
+        lines.append("No files to sample.\n")
     lines.append("\n")
 
     lines.append("## Forensics\n\n")
