@@ -89,6 +89,15 @@ def run_docling_stage(filepath: Path, db_path: Path, file_hash: str, config: dic
         finally:
             if temp_docx.exists():
                 temp_docx.unlink()
+    elif filepath.suffix.lower() == ".vsdx":
+        print(f"    [Visio] Converting Visio (.vsdx) file {filepath.name} to Markdown...")
+        try:
+            from scripts.visio_to_markdown_standalone import VisioToMarkdownConverter
+            converter = VisioToMarkdownConverter()
+            text_content = converter.convert(str(filepath), output_format="markdown")
+        except Exception as e:
+            print(f"    [Visio] Error converting Visio (.vsdx) file {filepath.name}: {e}")
+            raise e
     elif filepath.suffix.lower() in (".eml", ".msg"):
         text_content = ""
         if filepath.suffix.lower() == ".eml":

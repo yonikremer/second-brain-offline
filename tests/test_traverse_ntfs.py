@@ -34,7 +34,7 @@ class TestTraverseNTFS(unittest.TestCase):
         (self.src_dir / "file2.docx").write_text("docx content")
         (self.src_dir / "file3.zip").write_text("zip content")  # blacklisted
         (self.src_dir / "file4.csv").write_text("csv content")  # blacklisted
-        (self.src_dir / "file5.txt").write_text("txt content")  # unknown
+        (self.src_dir / "file5.xyz").write_text("xyz content")  # unknown
 
         whitelist = traverse_ntfs.DEFAULT_WHITELIST
         blacklist = traverse_ntfs.DEFAULT_BLACKLIST
@@ -50,14 +50,14 @@ class TestTraverseNTFS(unittest.TestCase):
 
         self.assertEqual(copied, 2)
         self.assertEqual(blacklisted, 2)
-        self.assertEqual(unknown[".txt"], 1)
+        self.assertEqual(unknown[".xyz"], 1)
 
         # Check copied files
         self.assertTrue((self.dest_dir / "file1.pdf").exists())
         self.assertTrue((self.dest_dir / "file2.docx").exists())
         self.assertFalse((self.dest_dir / "file3.zip").exists())
         self.assertFalse((self.dest_dir / "file4.csv").exists())
-        self.assertFalse((self.dest_dir / "file5.txt").exists())
+        self.assertFalse((self.dest_dir / "file5.xyz").exists())
 
     def test_traverse_flat_collision(self):
         # Create subfolders with same name files

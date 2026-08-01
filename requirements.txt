@@ -2,7 +2,7 @@ graphifyy==0.8.37
 docling>=2.117.0
 openai>=2.51.0
 pyyaml>=6.0.3
-
 openai
 docling
 extract-msg
+vsdx

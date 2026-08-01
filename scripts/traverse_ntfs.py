@@ -23,7 +23,11 @@ DEFAULT_WHITELIST = {
     # one note
     ".one", ".onetoc2",
     # mails
-    ".eml", ".msg"
+    ".eml", ".msg",
+    # texta and markdown
+    ".txt", ".md",
+    # visio files
+    ".vsdx", ".vsd"
 }
 
 DEFAULT_BLACKLIST = {
@@ -32,7 +36,35 @@ DEFAULT_BLACKLIST = {
     # excel
     ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods",
     # csv
-    ".csv"
+    ".csv",
+    # matlab
+    ".m", ".mat",
+    # sql / database
+    ".sql", ".db", ".sqlite", ".sqlite3", ".mdb", ".accdb",
+    # code
+    ".py", ".ipynb", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".cs", 
+    ".cpp", ".c", ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".swift",
+    # scripts / styling / config
+    ".sh", ".bat", ".ps1", ".css", ".scss", ".json", ".yaml", ".yml", 
+    ".xml", ".toml", ".ini", ".conf",
+    # executables / binaries
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".msi",
+    # system / temp
+    ".sys", ".tmp", ".log", ".bak", ".ds_store", ".thumbs.db", ".lnk",
+    # fonts
+    ".ttf", ".otf", ".woff", ".woff2",
+    # images
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".tiff", ".tif", ".ico", ".heic", ".heif",
+    # audio
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma", ".mid", ".midi",
+    # video
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpeg", ".mpg",
+    # logs
+    ".log",
+    # samples
+    ".64c", "64fc", ".32f", ".32fc", ".16c", "16fc", ".8c", "8fc",
+    # binary data
+    ".bit", ".sff", ".bin", ".raw",
 }
 
 
