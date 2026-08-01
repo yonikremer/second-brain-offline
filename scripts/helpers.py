@@ -268,3 +268,54 @@ def parse_truthness_human_answer(human_answer: str, default_score: int = 0, defa
         return score, justification
         
     return default_score, human_answer
+
+def chunk_text(text: str, max_chunk_size: int = 4000) -> list[str]:
+    text = text.replace("\r\n", "\n")
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    
+    for para in paragraphs:
+        para_len = len(para)
+        if current_len + (2 if current_chunk else 0) + para_len <= max_chunk_size:
+            current_chunk.append(para)
+            current_len += (2 if len(current_chunk) > 1 else 0) + para_len
+        else:
+            if current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+                
+            if para_len > max_chunk_size:
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                current_sentence_chunk = []
+                current_sent_len = 0
+                
+                for sent in sentences:
+                    sent_len = len(sent)
+                    if current_sent_len + (1 if current_sentence_chunk else 0) + sent_len <= max_chunk_size:
+                        current_sentence_chunk.append(sent)
+                        current_sent_len += (1 if len(current_sentence_chunk) > 1 else 0) + sent_len
+                    else:
+                        if current_sentence_chunk:
+                            chunks.append(" ".join(current_sentence_chunk))
+                            current_sentence_chunk = []
+                            current_sent_len = 0
+                        if sent_len > max_chunk_size:
+                            for i in range(0, sent_len, max_chunk_size):
+                                chunks.append(sent[i:i+max_chunk_size])
+                        else:
+                            current_sentence_chunk.append(sent)
+                            current_sent_len = sent_len
+                
+                if current_sentence_chunk:
+                    current_chunk.append(" ".join(current_sentence_chunk))
+                    current_len = len(current_chunk[-1])
+            else:
+                current_chunk.append(para)
+                current_len = para_len
+                
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+    return chunks

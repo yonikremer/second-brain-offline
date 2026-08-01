@@ -104,6 +104,17 @@ class TestPipelineLogic(unittest.TestCase):
         text = "בוט רקוב"
         self.assertEqual(process.fix_hebrew_layout(text, "REVERSED_BOTH"), "בוקר טוב")
 
+    def test_chunk_text_semantic(self):
+        import helpers
+        text = "Paragraph 1. Sentence 1. Sentence 2.\n\nParagraph 2. Sentence 3."
+        chunks = helpers.chunk_text(text, max_chunk_size=40)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0], "Paragraph 1. Sentence 1. Sentence 2.")
+        self.assertEqual(chunks[1], "Paragraph 2. Sentence 3.")
+        
+        chunks_sent = helpers.chunk_text(text, max_chunk_size=25)
+        self.assertEqual(len(chunks_sent), 3)
+
 class TestCascadeInvalidation(unittest.TestCase):
 
     def setUp(self):
