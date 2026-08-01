@@ -23,6 +23,7 @@ from helpers import (
     filter_glossary_entries,
     fix_hebrew_layout,
     parse_allowed_values,
+    chunk_text,
 )
 from llm_client import parse_json_response
 
@@ -192,53 +193,103 @@ def run_translation_stage(text_content: str, filepath: Path, db_path: Path, file
         translation_instructions += "\n\nIMPORTANT: You must proceed with best-effort translation. Do NOT trigger clarification or output 'Clarification Required'. If there are unknown terms, translate them to the best of your ability."
     
     current_text_to_translate = text_content
-    while True:
-        response_text = call_llm_fn(config, translation_instructions, current_text_to_translate)
-        
-        status_line = ""
-        payload = response_text
-        if response_text.startswith("RTL_STATUS:"):
-            lines = response_text.split('\n', 1)
-            status_line = lines[0].strip()
-            payload = lines[1].strip() if len(lines) > 1 else ""
-        
-        if any(x in status_line for x in ("REVERSED_WORDS", "REVERSED_SENTENCES", "REVERSED_BOTH")):
-            detected_status = "REVERSED_BOTH" if "REVERSED_BOTH" in status_line else ("REVERSED_WORDS" if "REVERSED_WORDS" in status_line else "REVERSED_SENTENCES")
-            print(f"    [RTL Status] Detected corruption: {detected_status}. Fixing locally and retrying...")
-            current_text_to_translate = fix_hebrew_layout(current_text_to_translate, detected_status)
-            continue
-        
-        if "NORMAL" in status_line:
+    if len(current_text_to_translate) <= 4000:
+        while True:
+            response_text = call_llm_fn(config, translation_instructions, current_text_to_translate)
+            
+            status_line = ""
+            payload = response_text
+            if response_text.startswith("RTL_STATUS:"):
+                lines = response_text.split('\n', 1)
+                status_line = lines[0].strip()
+                payload = lines[1].strip() if len(lines) > 1 else ""
+            
+            if any(x in status_line for x in ("REVERSED_WORDS", "REVERSED_SENTENCES", "REVERSED_BOTH")):
+                detected_status = "REVERSED_BOTH" if "REVERSED_BOTH" in status_line else ("REVERSED_WORDS" if "REVERSED_WORDS" in status_line else "REVERSED_SENTENCES")
+                print(f"    [RTL Status] Detected corruption: {detected_status}. Fixing locally and retrying...")
+                current_text_to_translate = fix_hebrew_layout(current_text_to_translate, detected_status)
+                continue
+            
+            if "Clarification Required" in payload:
+                term_match = re.search(r"Term/Issue:\s*(.*)", payload, re.IGNORECASE)
+                if not term_match:
+                    term_match = re.search(r"Term:\s*(.*)", payload, re.IGNORECASE)
+                term_to_clarify = term_match.group(1).strip() if term_match else "unknown term"
+                
+                context_sentence = ""
+                context_match = re.search(r"Context:\s*\"?(.*?)\"?(?:\n|$)", payload, re.IGNORECASE)
+                if context_match:
+                    context_sentence = context_match.group(1).strip()
+                    
+                if trans_review and trans_review[0] == 'rejected':
+                    print("    [Warning] Translation triggered clarification despite rejected review. Proceeding best-effort.")
+                else:
+                    context_json = json.dumps({
+                        "term": term_to_clarify,
+                        "context_sentence": context_sentence
+                    })
+                    trigger_review(db_path, filepath, file_hash, "translation", "clarification", context_json, "", conn=conn)
+                    upsert_file_status(db_path, str(filepath), file_hash, "needs_review", conn=conn)
+                    raise NeedsReviewException("Translation clarification required.")
+            
             translated_text = payload
-        else:
-            translated_text = response_text
+            break
+    else:
+        while True:
+            sample = current_text_to_translate[:2000]
+            sample_response = call_llm_fn(config, translation_instructions, sample)
             
-        if "Clarification Required" in translated_text:
-            term_match = re.search(r"Term/Issue:\s*(.*)", translated_text, re.IGNORECASE)
-            if not term_match:
-                term_match = re.search(r"Term:\s*(.*)", translated_text, re.IGNORECASE)
-            term_to_clarify = term_match.group(1).strip() if term_match else "unknown term"
+            status_line = ""
+            if sample_response.startswith("RTL_STATUS:"):
+                lines = sample_response.split('\n', 1)
+                status_line = lines[0].strip()
+                
+            if any(x in status_line for x in ("REVERSED_WORDS", "REVERSED_SENTENCES", "REVERSED_BOTH")):
+                detected_status = "REVERSED_BOTH" if "REVERSED_BOTH" in status_line else ("REVERSED_WORDS" if "REVERSED_WORDS" in status_line else "REVERSED_SENTENCES")
+                print(f"    [RTL Status] Detected corruption: {detected_status}. Fixing locally and retrying...")
+                current_text_to_translate = fix_hebrew_layout(current_text_to_translate, detected_status)
+                continue
+            break
             
-            context_sentence = ""
-            context_match = re.search(r"Context:\s*\"?(.*?)\"?(?:\n|$)", translated_text, re.IGNORECASE)
-            if context_match:
-                context_sentence = context_match.group(1).strip()
+        chunks = chunk_text(current_text_to_translate, 4000)
+        translated_chunks = []
+        for idx, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                print(f"    [Translation] Translating chunk {idx+1}/{len(chunks)}...")
+            response_text = call_llm_fn(config, translation_instructions, chunk)
+            
+            payload = response_text
+            if response_text.startswith("RTL_STATUS:"):
+                lines = response_text.split('\n', 1)
+                payload = lines[1].strip() if len(lines) > 1 else ""
                 
-            if trans_review and trans_review[0] == 'rejected':
-                print("    [Warning] Translation triggered clarification despite rejected review. Proceeding best-effort.")
-                upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash, conn=conn)
-                return translated_text
+            if "Clarification Required" in payload:
+                term_match = re.search(r"Term/Issue:\s*(.*)", payload, re.IGNORECASE)
+                if not term_match:
+                    term_match = re.search(r"Term:\s*(.*)", payload, re.IGNORECASE)
+                term_to_clarify = term_match.group(1).strip() if term_match else "unknown term"
                 
-            context_json = json.dumps({
-                "term": term_to_clarify,
-                "context_sentence": context_sentence
-            })
-            trigger_review(db_path, filepath, file_hash, "translation", "clarification", context_json, "", conn=conn)
-            upsert_file_status(db_path, str(filepath), file_hash, "needs_review", conn=conn)
-            raise NeedsReviewException("Translation clarification required.")
-        else:
-            upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash, conn=conn)
-            return translated_text
+                context_sentence = ""
+                context_match = re.search(r"Context:\s*\"?(.*?)\"?(?:\n|$)", payload, re.IGNORECASE)
+                if context_match:
+                    context_sentence = context_match.group(1).strip()
+                    
+                if trans_review and trans_review[0] == 'rejected':
+                    print("    [Warning] Translation triggered clarification despite rejected review. Proceeding best-effort.")
+                else:
+                    context_json = json.dumps({
+                        "term": term_to_clarify,
+                        "context_sentence": context_sentence
+                    })
+                    trigger_review(db_path, filepath, file_hash, "translation", "clarification", context_json, "", conn=conn)
+                    upsert_file_status(db_path, str(filepath), file_hash, "needs_review", conn=conn)
+                    raise NeedsReviewException("Translation clarification required.")
+                    
+            translated_chunks.append(payload)
+        translated_text = "\n".join(translated_chunks)
+        
+    upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash, conn=conn)
+    return translated_text
 
 def run_classification_stage(stage: str, trans_text: str, filepath: Path, db_path: Path, file_hash: str, config: dict, current_model: str, current_instr_hash: str, conn: sqlite3.Connection, instr_path: Path, call_llm_fn: callable) -> str:
     instructions = instr_path.read_text(encoding="utf-8")
