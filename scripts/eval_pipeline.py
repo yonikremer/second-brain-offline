@@ -294,8 +294,169 @@ def build_forensics(
     }
 
 
+def _status_table(statuses: dict[str, dict]) -> dict[str, int]:
+    counts = Counter(s.get("status", "unknown") for s in statuses.values())
+    return dict(counts)
+
+
+def build_report(
+    raw_root: Path,
+    processed_md_root: Path,
+    db_path: Path,
+    instructions_root: Path,
+    sample_size: int,
+    seed: int | None,
+    review_dir: Path | None = None,
+) -> dict:
+    raw_files = get_raw_files(raw_root)
+    statuses = get_file_statuses(db_path)
+
+    coverage = check_coverage(raw_files, statuses)
+    output_health = check_output_health(
+        raw_root, processed_md_root, db_path, instructions_root
+    )
+    review_queue = check_review_queue(db_path, total_files=len(raw_files))
+
+    processed_paths = [
+        Path(fp) for fp, info in statuses.items() if info.get("status") == "processed"
+    ]
+    samples = sample_files(processed_paths, sample_size, seed=seed)
+    forensics = [
+        build_forensics(p, db_path, raw_root, processed_md_root, review_dir)
+        for p in samples
+    ]
+
+    checks = [coverage, output_health, review_queue]
+    critical_failures = sum(1 for c in checks if c.get("critical") and not c["ok"])
+    warnings = sum(1 for c in checks if not c.get("critical") and not c["ok"])
+
+    return {
+        "summary": {
+            "total": len(raw_files),
+            "critical_failures": critical_failures,
+            "warnings": warnings,
+            "review_rate": review_queue["details"]["review_rate"],
+            "status_counts": _status_table(statuses),
+        },
+        "checks": [
+            {"name": c["name"], "ok": c["ok"], "detail": _check_detail(c)}
+            for c in checks
+        ],
+        "review_breakdown": [
+            {"stage": s, "trigger": t, "count": count}
+            for (s, t), count in review_queue["details"]["by_trigger"].items()
+        ],
+        "samples": [{"raw": str(s)} for s in samples],
+        "forensics": forensics,
+    }
+
+
+def _check_detail(check: dict) -> str:
+    if check["ok"]:
+        return "PASS"
+    if check["name"] == "Coverage":
+        d = check["details"]
+        return f"missing={len(d['missing'])}, pending={d['pending_count']}, unknown={d['unknown_status_count']}"
+    if check["name"] == "Output health":
+        return f"errors={len(check.get('errors', []))}, warnings={len(check.get('warnings', []))}"
+    if check["name"] == "Review queue signal":
+        return f"rate={check['details']['review_rate']:.1%}, pending={check['details']['pending_count']}"
+    return "FAIL"
+
+
+def write_report(report: dict, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Pipeline Real-Docs Evaluation Report\n\n"]
+    lines.append(f"Generated: {datetime.now().isoformat()}\n\n")
+
+    summary = report["summary"]
+    lines.append("## Summary\n\n")
+    lines.append(f"- Total raw files: {summary['total']}\n")
+    lines.append(f"- Critical failures: {summary['critical_failures']}\n")
+    lines.append(f"- Warnings: {summary['warnings']}\n")
+    lines.append(f"- Review rate: {summary['review_rate']:.1%}\n\n")
+
+    lines.append("## Coverage\n\n")
+    lines.append("| Status | Count |\n|---|---|\n")
+    for status, count in sorted(summary["status_counts"].items()):
+        lines.append(f"| {status} | {count} |\n")
+    lines.append("\n")
+
+    lines.append("## Checks\n\n")
+    lines.append("| Check | Result | Detail |\n|---|---|---|\n")
+    for c in report["checks"]:
+        result = "PASS" if c["ok"] else "FAIL"
+        lines.append(f"| {c['name']} | {result} | {c['detail']} |\n")
+    lines.append("\n")
+
+    lines.append("## Review queue breakdown\n\n")
+    if report["review_breakdown"]:
+        lines.append("| Stage | Trigger | Count |\n|---|---|---|\n")
+        for item in report["review_breakdown"]:
+            lines.append(f"| {item['stage']} | {item['trigger']} | {item['count']} |\n")
+    else:
+        lines.append("No pending review items.\n")
+    lines.append("\n")
+
+    lines.append("## Sample spot-check\n\n")
+    if report["samples"]:
+        for item in report["samples"]:
+            lines.append(f"- `{item['raw']}`\n")
+    else:
+        lines.append("No processed files to sample.\n")
+    lines.append("\n")
+
+    lines.append("## Forensics\n\n")
+    for f in report["forensics"]:
+        lines.append(f"### `{f['rel_path']}`\n\n")
+        lines.append(f"- Raw: `{f['raw_path']}`\n")
+        lines.append(f"- Processed: `{f['processed_path']}`\n")
+        lines.append(f"- DB hash: {f['db_hash']}\n")
+        lines.append(f"- Current hash: {f['current_hash']}\n")
+        lines.append("- Stage outputs:\n")
+        for stage, data in f["stage_outputs"].items():
+            preview = (data.get("output_text") or "")[:200].replace("\n", " ")
+            lines.append(f"  - `{stage}`: {preview}\n")
+        if f["review_files"]:
+            lines.append("- Review files:\n")
+            for rf in f["review_files"]:
+                lines.append(f"  - `{rf}`\n")
+        lines.append("\n")
+
+    out_path.write_text("".join(lines), encoding="utf-8")
+
+
 def main():
-    pass
+    parser = argparse.ArgumentParser(description="Evaluate the document pipeline on real docs.")
+    parser.add_argument("--raw", type=Path, default=Path("raw"))
+    parser.add_argument("--processed", type=Path, default=Path("processed_md"))
+    parser.add_argument("--db", type=Path, default=Path("pipeline.db"))
+    parser.add_argument("--instructions", type=Path, default=Path("instructions"))
+    parser.add_argument("--report-dir", type=Path, default=Path("eval_reports"))
+    parser.add_argument("--sample-size", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--review-dir", type=Path, default=Path("review"))
+    args = parser.parse_args()
+
+    report = build_report(
+        args.raw,
+        args.processed,
+        args.db,
+        args.instructions,
+        args.sample_size,
+        args.seed,
+        args.review_dir,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = args.report_dir / f"eval_report_{timestamp}.md"
+    write_report(report, report_path)
+    print(f"Report written to {report_path}")
+
+    critical_failures = report["summary"]["critical_failures"]
+    if critical_failures:
+        print(f"CRITICAL FAILURES: {critical_failures}")
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

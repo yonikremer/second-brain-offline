@@ -348,5 +348,38 @@ class TestForensics(unittest.TestCase):
         self.assertEqual(result["stage_outputs"], {})
 
 
+class TestReportAndCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_write_report_creates_markdown(self):
+        report = {
+            "summary": {
+                "total": 5,
+                "critical_failures": 1,
+                "warnings": 0,
+                "review_rate": 0.2,
+                "status_counts": {"processed": 4, "needs_review": 1},
+            },
+            "checks": [
+                {"name": "Coverage", "ok": True, "detail": "PASS"},
+                {"name": "Output health", "ok": False, "detail": "1 error"},
+            ],
+            "review_breakdown": [],
+            "samples": [],
+            "forensics": [],
+        }
+        out_path = self.root / "report.md"
+        ep.write_report(report, out_path)
+        self.assertTrue(out_path.exists())
+        content = out_path.read_text(encoding="utf-8")
+        self.assertIn("Pipeline Real-Docs Evaluation Report", content)
+        self.assertIn("Output health", content)
+
+
 if __name__ == "__main__":
     unittest.main()
