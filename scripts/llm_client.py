@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+import time
 from openai import OpenAI
 
 def call_llm(config: dict, system_prompt: str, user_prompt: str) -> str:
@@ -9,20 +10,31 @@ def call_llm(config: dict, system_prompt: str, user_prompt: str) -> str:
     model = config["llm"]["model"]
     
     client = OpenAI(base_url=api_base, api_key=api_key)
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.0
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error connecting to local LLM at {api_base}: {e}", file=sys.stderr)
-        print("Please check if Ollama or your LLM server is running.", file=sys.stderr)
-        raise
+    
+    max_retries = 5
+    backoff_factor = 2.0
+    initial_delay = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Error connecting to LLM at {api_base} (Attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
+                print("Please check if Ollama or your LLM server is running.", file=sys.stderr)
+                raise
+            else:
+                delay = initial_delay * (backoff_factor ** attempt)
+                print(f"LLM call failed: {e}. Retrying in {delay:.1f}s (Attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                time.sleep(delay)
 
 def parse_json_response(response_text: str) -> dict:
     cleaned = response_text.strip()
