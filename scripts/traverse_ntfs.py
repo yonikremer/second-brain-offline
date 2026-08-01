@@ -16,6 +16,8 @@ import sys
 DEFAULT_WHITELIST = {
     # pdf
     ".pdf",
+    # html
+    ".html", ".htm",
     # docs
     ".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt", ".rtf",
     # one note
