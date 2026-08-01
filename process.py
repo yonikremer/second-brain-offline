@@ -41,6 +41,9 @@ def get_instruction_hash(instruction_path: Path) -> str:
     return hasher.hexdigest()
 
 # SQLite Database Helper Functions
+class NeedsReviewException(Exception):
+    pass
+
 def init_db(db_path: Path):
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
@@ -50,7 +53,7 @@ def init_db(db_path: Path):
     CREATE TABLE IF NOT EXISTS files (
         filepath TEXT PRIMARY KEY,
         file_hash TEXT NOT NULL,
-        status TEXT NOT NULL,          -- 'pending', 'processed', 'filtered', 'error'
+        status TEXT NOT NULL,          -- 'pending', 'processed', 'filtered', 'error', 'needs_review'
         error_message TEXT,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -69,8 +72,147 @@ def init_db(db_path: Path):
     );
     """)
     
+    # review_queue table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS review_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_hash TEXT NOT NULL,
+        filepath TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        trigger_type TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        proposed_answer TEXT,
+        human_answer TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        resolution_note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        resolved_at TIMESTAMP,
+        UNIQUE(file_hash, stage, trigger_type)
+    );
+    """)
+    
     conn.commit()
     conn.close()
+
+def trigger_review(db_path: Path, filepath: Path, file_hash: str, stage: str, trigger_type: str, context_json: str, proposed_answer: str):
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    INSERT INTO review_queue (file_hash, filepath, stage, trigger_type, context_json, proposed_answer, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+    ON CONFLICT(file_hash, stage, trigger_type) DO UPDATE SET
+        filepath = excluded.filepath,
+        context_json = excluded.context_json,
+        proposed_answer = excluded.proposed_answer
+    """, (file_hash, str(filepath), stage, trigger_type, context_json, proposed_answer))
+    
+    cursor.execute(
+        "SELECT id FROM review_queue WHERE file_hash = ? AND stage = ? AND trigger_type = ?",
+        (file_hash, stage, trigger_type)
+    )
+    row = cursor.fetchone()
+    queue_id = row[0] if row else None
+    
+    conn.commit()
+    conn.close()
+    
+    short_hash = file_hash[:8]
+    review_dir = Path("review")
+    review_dir.mkdir(exist_ok=True)
+    review_filename = f"{filepath.name}--{short_hash}--{stage}--{trigger_type}.md"
+    review_path = review_dir / review_filename
+    
+    try:
+        display_path = filepath.relative_to(Path.cwd()).as_posix()
+    except ValueError:
+        display_path = filepath.name
+        
+    if review_path.exists():
+        print(f"    [Warning] Review file {review_path} already exists. Skipping write.")
+    else:
+        body = ""
+        if trigger_type == "clarification":
+            context_data = json.loads(context_json)
+            term = context_data.get("term", "")
+            context_sentence = context_data.get("context_sentence", "")
+            body = f'## Term/Issue\n"{term}"\n\n## Context\n> {context_sentence}\n\n## Proposed answer\n*(none — LLM could not infer this term)*'
+        elif trigger_type == "new_category":
+            context_data = json.loads(context_json)
+            proposed_val = context_data.get("proposed_value", "")
+            existing_vals = context_data.get("existing_values", [])
+            existing_list = "\n".join(f"- {v}" for v in existing_vals)
+            body = f'## Proposed Category\n"{proposed_val}"\n\n## Existing Categories\n{existing_list}'
+        elif trigger_type == "parse_failure":
+            context_data = json.loads(context_json)
+            raw_resp = context_data.get("raw_response", "")
+            body = f'## Raw LLM Response\n```json\n{raw_resp}\n```'
+        elif trigger_type == "low_score":
+            context_data = json.loads(context_json)
+            parsed_score = context_data.get("parsed_score", "")
+            parsed_just = context_data.get("parsed_justification", "")
+            body = f'## Score\n{parsed_score}\n\n## Justification\n{parsed_just}'
+
+        title_map = {
+            "clarification": "Translation Clarification",
+            "new_category": "New Category Proposed",
+            "parse_failure": "Truthness Parse Failure",
+            "low_score": "Truthness Low Score"
+        }
+        title = title_map.get(trigger_type, "Review Needed")
+
+        content = f"""---
+queue_id: {queue_id}
+file_hash: {file_hash}
+filepath: {display_path}
+stage: {stage}
+trigger: {trigger_type}
+status: pending
+proposed_answer: "{proposed_answer.replace('"', '\\"')}"
+human_answer: ""
+resolution_note: ""
+---
+
+# Review Needed: {title}
+
+**File:** `{display_path}`  
+**Stage:** {stage}  
+**Trigger:** {trigger_type}
+
+{body}
+
+## Your answer
+Edit `human_answer` in the frontmatter, then change `status` to `accepted` or `rejected`.
+"""
+        review_path.write_text(content, encoding="utf-8")
+        print(f"    [Review] Created review file: {review_path}")
+
+def parse_truthness_human_answer(human_answer: str, default_score: int = 0, default_justification: str = "") -> tuple[int, str]:
+    if not human_answer:
+        return default_score, default_justification
+    human_answer = human_answer.strip()
+    try:
+        data = json.loads(human_answer)
+        if isinstance(data, dict):
+            return int(data.get("score", default_score)), data.get("justification", default_justification)
+    except json.JSONDecodeError:
+        pass
+    
+    m = re.match(r"score:\s*(\d+)(?:,\s*justification:\s*(.*))?", human_answer, re.IGNORECASE)
+    if m:
+        score = int(m.group(1))
+        justification = m.group(2).strip() if m.group(2) else default_justification
+        return score, justification
+        
+    m_int = re.search(r"\b(\d+)\b", human_answer)
+    if m_int:
+        score = int(m_int.group(1))
+        justification = human_answer.replace(m_int.group(0), "", 1).strip(", -:").strip()
+        if not justification:
+            justification = default_justification
+        return score, justification
+        
+    return default_score, human_answer
 
 def get_cached_stages(db_path: Path, file_hash: str) -> dict:
     conn = sqlite3.connect(str(db_path))
@@ -430,6 +572,21 @@ def process_file(
     
     file_hash = compute_file_hash(filepath)
     
+    # Check if there is any pending review item for this file_hash
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stage, trigger_type FROM review_queue WHERE file_hash = ? AND status = 'pending'",
+        (file_hash,)
+    )
+    pending_items = cursor.fetchall()
+    conn.close()
+    
+    if pending_items:
+        print(f"    [Pending Review] File is blocked by pending review for stage '{pending_items[0][0]}' (trigger: '{pending_items[0][1]}').")
+        upsert_file_status(db_path, str(filepath), file_hash, "needs_review")
+        raise NeedsReviewException(f"Blocked by pending review for stage '{pending_items[0][0]}'")
+    
     # Invalidate file-level cache if file hash changed
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
@@ -462,7 +619,7 @@ def process_file(
             if stage in ["translation", "subdomain", "doc_type", "truthness"]:
                 model_ok = (cache["model_name"] == current_model)
                 
-            instr_ok = (cache["instructions_hash"] == current_instr_hash)
+            instr_ok = (cache["instructions_hash"] or "") == (current_instr_hash or "")
             if model_ok and instr_ok:
                 cache_valid = True
                 
@@ -541,6 +698,19 @@ def process_file(
                 if glossary_path.exists():
                     translation_instructions += f"\n\n# Active Glossary (glossary.md)\n{glossary_path.read_text(encoding='utf-8')}"
                 
+                # Check for rejected review to apply best-effort
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT status FROM review_queue WHERE file_hash = ? AND stage = 'translation' AND trigger_type = 'clarification'",
+                    (file_hash,)
+                )
+                trans_review = cursor.fetchone()
+                conn.close()
+                
+                if trans_review and trans_review[0] == 'rejected':
+                    translation_instructions += "\n\nIMPORTANT: You must proceed with best-effort translation. Do NOT trigger clarification or output 'Clarification Required'. If there are unknown terms, translate them to the best of your ability."
+                
                 current_text_to_translate = text_content
                 while True:
                     response_text = call_llm(config, translation_instructions, current_text_to_translate)
@@ -564,61 +734,155 @@ def process_file(
                         translated_text = response_text
                         
                     if "Clarification Required" in translated_text:
-                        print(f"\n    [Clarification Triggered] LLM requested clarification:")
-                        print("-" * 60)
-                        print(translated_text)
-                        print("-" * 60)
-                        
-                        term_match = re.search(r"Term/Issue:\s*(.*)", translated_text)
+                        term_match = re.search(r"Term/Issue:\s*(.*)", translated_text, re.IGNORECASE)
+                        if not term_match:
+                            term_match = re.search(r"Term:\s*(.*)", translated_text, re.IGNORECASE)
                         term_to_clarify = term_match.group(1).strip() if term_match else "unknown term"
                         
-                        print(f"Please provide translation for: '{term_to_clarify}'")
-                        user_answer = input("Translation: ").strip()
-                        user_notes = input("Context/Notes (optional): ").strip()
-                        
-                        # Write glossary entry
-                        if not glossary_path.exists():
-                            glossary_path.write_text(
-                                "# Glossary\n\n| Hebrew/Internal Term | English Translation | Notes |\n|---|---|---|\n",
-                                encoding="utf-8"
-                            )
-                        
-                        existing_glossary = glossary_path.read_text(encoding="utf-8").rstrip()
-                        new_row = f"| {term_to_clarify} | {user_answer} | {user_notes} |\n"
-                        glossary_path.write_text(existing_glossary + "\n" + new_row, encoding="utf-8")
-                        print(f"    [Glossary] Added '{term_to_clarify}' -> '{user_answer}' to glossary.md")
-                        
-                        # Rebuild instructions and loop
-                        translation_instructions = instr_path.read_text(encoding="utf-8")
-                        translation_instructions += f"\n\n# Active Glossary (glossary.md)\n{glossary_path.read_text(encoding='utf-8')}"
-                        continue
+                        context_sentence = ""
+                        context_match = re.search(r"Context:\s*\"?(.*?)\"?(?:\n|$)", translated_text, re.IGNORECASE)
+                        if context_match:
+                            context_sentence = context_match.group(1).strip()
+                            
+                        if trans_review and trans_review[0] == 'rejected':
+                            print("    [Warning] Translation triggered clarification despite rejected review. Proceeding best-effort.")
+                            text_content = translated_text
+                            upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash)
+                            break
+                            
+                        context_json = json.dumps({
+                            "term": term_to_clarify,
+                            "context_sentence": context_sentence
+                        })
+                        trigger_review(db_path, filepath, file_hash, "translation", "clarification", context_json, "")
+                        upsert_file_status(db_path, str(filepath), file_hash, "needs_review")
+                        raise NeedsReviewException("Translation clarification required.")
                     else:
                         text_content = translated_text
                         upsert_stage_output(db_path, file_hash, "translation", translated_text, current_model, current_instr_hash)
                         break
                 
-        elif stage == "subdomain":
-            # Consume translation output
+        elif stage in ("subdomain", "doc_type"):
             trans_text = get_cached_stages(db_path, file_hash)["translation"]["output_text"]
-            subdomain_instructions = instr_path.read_text(encoding="utf-8")
-            subdomain_val = call_llm(config, subdomain_instructions, trans_text)
-            subdomain_val = verify_or_update_category("subdomain", subdomain_val, instr_path)
-            current_instr_hash = get_instruction_hash(instr_path)
-            upsert_stage_output(db_path, file_hash, "subdomain", subdomain_val, current_model, current_instr_hash)
+            instructions = instr_path.read_text(encoding="utf-8")
             
-        elif stage == "doc_type":
-            trans_text = get_cached_stages(db_path, file_hash)["translation"]["output_text"]
-            doctype_instructions = instr_path.read_text(encoding="utf-8")
-            doctype_val = call_llm(config, doctype_instructions, trans_text)
-            doctype_val = verify_or_update_category("doc_type", doctype_val, instr_path)
-            current_instr_hash = get_instruction_hash(instr_path)
-            upsert_stage_output(db_path, file_hash, "doc_type", doctype_val, current_model, current_instr_hash)
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, proposed_answer FROM review_queue WHERE file_hash = ? AND stage = ? AND trigger_type = 'new_category'",
+                (file_hash, stage)
+            )
+            cat_review = cursor.fetchone()
+            conn.close()
+            
+            rejected_category = None
+            if cat_review and cat_review[0] == 'rejected':
+                rejected_category = cat_review[1]
+                instructions += f"\n\nNote: The category '{rejected_category}' is NOT allowed. Please classify into one of the other allowed categories."
+            
+            val = call_llm(config, instructions, trans_text)
+            val_clean = val.strip()
+            
+            allowed_values = parse_allowed_values(instr_path)
+            matched = None
+            for allowed in allowed_values:
+                if val_clean.lower() == allowed.lower():
+                    matched = allowed
+                    break
+                    
+            if matched:
+                upsert_stage_output(db_path, file_hash, stage, matched, current_model, current_instr_hash)
+            else:
+                if rejected_category and val_clean.lower() == rejected_category.lower():
+                    fallback = "other" if "other" in [a.lower() for a in allowed_values] else (allowed_values[0] if allowed_values else "other")
+                    for allowed in allowed_values:
+                        if allowed.lower() == fallback.lower():
+                            fallback = allowed
+                            break
+                    print(f"    [Warning] LLM proposed rejected category '{val_clean}'. Falling back to '{fallback}'.")
+                    upsert_stage_output(db_path, file_hash, stage, fallback, current_model, current_instr_hash)
+                else:
+                    context_json = json.dumps({
+                        "proposed_value": val_clean,
+                        "existing_values": allowed_values,
+                        "focus_hint": "Added automatically in non-interactive run."
+                    })
+                    trigger_review(db_path, filepath, file_hash, stage, "new_category", context_json, val_clean)
+                    upsert_file_status(db_path, str(filepath), file_hash, "needs_review")
+                    raise NeedsReviewException(f"New {stage} category '{val_clean}' proposed.")
             
         elif stage == "truthness":
             trans_text = get_cached_stages(db_path, file_hash)["translation"]["output_text"]
             truthness_instructions = instr_path.read_text(encoding="utf-8")
-            truthness_val = call_llm(config, truthness_instructions, trans_text)
-            upsert_stage_output(db_path, file_hash, "truthness", truthness_val, current_model, current_instr_hash)
+            
+            # Check if there is already a resolved review for truthness to avoid calling LLM
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, proposed_answer FROM review_queue WHERE file_hash = ? AND stage = 'truthness'",
+                (file_hash,)
+            )
+            truth_review_row = cursor.fetchone()
+            conn.close()
+            
+            if truth_review_row and truth_review_row[0] in ('accepted', 'rejected'):
+                truthness_val = truth_review_row[1]
+                print(f"    [Truthness Review] Already resolved: {truth_review_row[0]}. Using cached proposed answer.")
+            else:
+                truthness_val = call_llm(config, truthness_instructions, trans_text)
+            
+            score = 0
+            justification = ""
+            is_parse_failure = False
+            is_low_score = False
+            
+            try:
+                truthness_data = parse_json_response(truthness_val)
+                score = truthness_data.get("score", 0)
+                justification = truthness_data.get("justification", "")
+                
+                threshold = config.get("truthness", {}).get("threshold", 4)
+                if score < threshold:
+                    is_low_score = True
+            except Exception as e:
+                is_parse_failure = True
+                justification = truthness_val
+                
+            if is_parse_failure or is_low_score:
+                trigger_type = "parse_failure" if is_parse_failure else "low_score"
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT status FROM review_queue WHERE file_hash = ? AND stage = 'truthness' AND trigger_type = ?",
+                    (file_hash, trigger_type)
+                )
+                truth_review = cursor.fetchone()
+                conn.close()
+                
+                if truth_review and truth_review[0] in ('accepted', 'rejected'):
+                    print(f"    [Truthness Review] Already resolved: {truth_review[0]}. Proceeding.")
+                    upsert_stage_output(db_path, file_hash, "truthness", truthness_val, current_model, current_instr_hash)
+                else:
+                    if is_parse_failure:
+                        context_json = json.dumps({
+                            "raw_response": truthness_val,
+                            "parsed_score": None,
+                            "parsed_justification": None
+                        })
+                        trigger_review(db_path, filepath, file_hash, "truthness", "parse_failure", context_json, truthness_val)
+                        upsert_file_status(db_path, str(filepath), file_hash, "needs_review")
+                        raise NeedsReviewException("Truthness parse failure.")
+                    else:
+                        context_json = json.dumps({
+                            "raw_response": truthness_val,
+                            "parsed_score": score,
+                            "parsed_justification": justification
+                        })
+                        trigger_review(db_path, filepath, file_hash, "truthness", "low_score", context_json, json.dumps({"score": score, "justification": justification}))
+                        upsert_file_status(db_path, str(filepath), file_hash, "needs_review")
+                        raise NeedsReviewException(f"Truthness score {score} is below threshold.")
+            else:
+                upsert_stage_output(db_path, file_hash, "truthness", truthness_val, current_model, current_instr_hash)
             
     # Write final output MD file (re-load all processed state to write frontmatter)
     final_cache = get_cached_stages(db_path, file_hash)
@@ -627,15 +891,38 @@ def process_file(
     doctype = final_cache["doc_type"]["output_text"]
     truthness_raw = final_cache["truthness"]["output_text"]
     
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT status, human_answer FROM review_queue WHERE file_hash = ? AND stage = 'truthness'",
+        (file_hash,)
+    )
+    truth_review = cursor.fetchone()
+    conn.close()
+    
     score = 0
     justification = ""
-    try:
-        truthness_data = parse_json_response(truthness_raw)
-        score = truthness_data.get("score", 0)
-        justification = truthness_data.get("justification", "")
-    except Exception as e:
-        print(f"    [Warning] Failed to parse truthness JSON: {e}. Storing raw string instead.")
-        justification = truthness_raw
+    
+    if truth_review and truth_review[0] == 'accepted':
+        human_ans = truth_review[1]
+        orig_score = 0
+        orig_just = truthness_raw
+        try:
+            truthness_data = parse_json_response(truthness_raw)
+            orig_score = truthness_data.get("score", 0)
+            orig_just = truthness_data.get("justification", "")
+        except Exception:
+            pass
+        score, justification = parse_truthness_human_answer(human_ans, orig_score, orig_just)
+        print(f"    [Truthness Override] Applying human review decision: score={score}")
+    else:
+        try:
+            truthness_data = parse_json_response(truthness_raw)
+            score = truthness_data.get("score", 0)
+            justification = truthness_data.get("justification", "")
+        except Exception as e:
+            print(f"    [Warning] Failed to parse truthness JSON: {e}. Storing raw string instead.")
+            justification = truthness_raw
         
     orig_text = final_cache["docling"]["output_text"]
     lang_status = "hebrew -> english" if needs_translation(orig_text) else "english (skipped translation)"
@@ -706,27 +993,28 @@ def main():
     
     success_count = 0
     error_count = 0
+    review_count = 0
     
     for fpath in files_to_process:
         try:
-            # We hash inside process_file
-            # In case of explicit stage re-run request without --force, we only re-run if invalid.
-            # But if a stage is explicitly specified AND --force is active, it invalidates.
             process_file(fpath, raw_root, output_root, db_path, config, force_stage)
             success_count += 1
+        except NeedsReviewException as e:
+            print(f"    [Needs Review] {fpath.name}: {e}")
+            review_count += 1
         except Exception as e:
             print(f"    [Error] Failed to process {fpath}: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
             error_count += 1
-            # Try to save file status as error in DB
             try:
                 file_hash = compute_file_hash(fpath)
                 upsert_file_status(db_path, str(fpath), file_hash, "error", str(e))
             except Exception:
                 pass
                 
-    print(f"\nPipeline finished. Success: {success_count}, Errors/Failures: {error_count}")
+    print(f"\nPipeline finished. Success: {success_count}, Errors/Failures: {error_count}, Needs Review: {review_count}")
+    print(f"Summary: {success_count} processed, {review_count} need review")
     if error_count > 0:
         sys.exit(1)
     sys.exit(0)

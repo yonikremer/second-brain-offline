@@ -245,9 +245,11 @@ class TestInteractiveTranslation(unittest.TestCase):
             Path("glossary.md").unlink()
 
     @patch("process.call_llm")
-    @patch("process.input")
-    def test_interactive_translation_loop(self, mock_input, mock_call_llm):
+    def test_interactive_translation_loop(self, mock_call_llm):
         from unittest.mock import patch, MagicMock
+        import sys
+        sys.path.append(str(Path.cwd()))
+        import scripts.review
         
         # We simulate a file that needs translation
         raw_file = self.root / "raw" / "doc.txt"
@@ -269,23 +271,43 @@ class TestInteractiveTranslation(unittest.TestCase):
             '{"score": 9, "justification": "trusted"}'
         ]
         
-        # User answers the clarification (Translation, Notes)
-        mock_input.side_effect = ["Hello", "Greeting notes"]
-        
         # Stub the docling converter to return our custom raw text
         with patch("process.DocumentConverter") as mock_converter_cls:
             mock_conv = MagicMock()
             mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום"
             mock_converter_cls.return_value = mock_conv
             
-            # Execute pipeline on the file
-            process.process_file(
-                filepath=raw_file,
+            # Execute pipeline on the file, should raise NeedsReviewException
+            with self.assertRaises(process.NeedsReviewException):
+                process.process_file(
+                    filepath=raw_file,
+                    raw_root=self.root / "raw",
+                    output_root=self.root / "processed_md",
+                    db_path=db_path,
+                    config=self.config,
+                    force_stage=None
+                )
+            
+            # Verify review file was created
+            review_dir = Path("review")
+            self.assertTrue(review_dir.exists())
+            review_files = list(review_dir.glob("*.md"))
+            self.assertEqual(len(review_files), 1)
+            review_file = review_files[0]
+            
+            # Simulate human response
+            content = review_file.read_text(encoding="utf-8")
+            content = content.replace('status: pending', 'status: accepted')
+            content = content.replace('human_answer: ""', 'human_answer: "Hello"')
+            content = content.replace('resolution_note: ""', 'resolution_note: "Greeting notes"')
+            review_file.write_text(content, encoding="utf-8")
+            
+            # Call apply_reviews from scripts.review
+            scripts.review.apply_reviews(
+                db_path=db_path,
                 raw_root=self.root / "raw",
                 output_root=self.root / "processed_md",
-                db_path=db_path,
-                config=self.config,
-                force_stage=None
+                config=self.config
             )
             
         # Verify glossary.md was created in root
@@ -301,6 +323,12 @@ class TestInteractiveTranslation(unittest.TestCase):
         out_content = out_file.read_text(encoding="utf-8")
         self.assertIn("Hello", out_content)
         self.assertIn("truthness_score: 9", out_content)
+        
+        # Cleanup review folder
+        if review_dir.exists():
+            for f in review_dir.glob("*"):
+                f.unlink()
+            review_dir.rmdir()
 
     @patch("process.call_llm")
     def test_translation_stage_with_reversed_words_retry(self, mock_call_llm):
@@ -502,6 +530,151 @@ class TestCategoryVerification(unittest.TestCase):
         
         val = process.verify_or_update_category("doc_type", "unknown-type", doc_types_file)
         self.assertEqual(val, "other")
+
+class TestHumanReviewQueueFlow(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        (self.root / "raw").mkdir()
+        (self.root / "instructions").mkdir()
+        (self.root / "processed_md").mkdir()
+        
+        self.subdomains_file = self.root / "instructions" / "subdomains.md"
+        self.subdomains_file.write_text("# Subdomains\n\n## Allowed Subdomains\n\n1. **Tech**\n   - Tech topics\n2. **other**\n   - Other topics\n", encoding="utf-8")
+        
+        (self.root / "instructions" / "translation.md").write_text("translation rules", encoding="utf-8")
+        (self.root / "instructions" / "document_types.md").write_text("# Doc Types\n\n## Allowed Document Types\n\n1. **concept**\n   - concept\n", encoding="utf-8")
+        (self.root / "instructions" / "truthness.md").write_text("truthness rules", encoding="utf-8")
+        
+        self.orig_instructions = process.STAGE_INSTRUCTIONS.copy()
+        process.STAGE_INSTRUCTIONS["translation"] = self.root / "instructions" / "translation.md"
+        process.STAGE_INSTRUCTIONS["subdomain"] = self.root / "instructions" / "subdomains.md"
+        process.STAGE_INSTRUCTIONS["doc_type"] = self.root / "instructions" / "document_types.md"
+        process.STAGE_INSTRUCTIONS["truthness"] = self.root / "instructions" / "truthness.md"
+        
+        self.config = {
+            "llm": {
+                "api_base": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "llama3"
+            },
+            "truthness": {
+                "threshold": 4
+            }
+        }
+        
+        self.review_dir = Path("review")
+        if self.review_dir.exists():
+            for f in self.review_dir.glob("*"):
+                if f.is_file():
+                    f.unlink()
+            
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        process.STAGE_INSTRUCTIONS = self.orig_instructions
+        if self.review_dir.exists():
+            for f in self.review_dir.glob("*"):
+                if f.is_file():
+                    f.unlink()
+            try:
+                self.review_dir.rmdir()
+            except OSError:
+                pass
+        if Path("glossary.md").exists():
+            Path("glossary.md").unlink()
+
+    @patch("process.call_llm")
+    def test_new_subdomain_category_trigger_and_resolve(self, mock_call_llm):
+        import scripts.review
+        from unittest.mock import patch, MagicMock
+        
+        raw_file = self.root / "raw" / "doc.txt"
+        raw_file.write_text("שלום עולם", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        mock_call_llm.side_effect = [
+            "Translated text",
+            "Security",
+            "Security",
+            "concept",
+            '{"score": 8, "justification": "good"}'
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום עולם"
+            mock_converter_cls.return_value = mock_conv
+            
+            with self.assertRaises(process.NeedsReviewException):
+                process.process_file(raw_file, self.root / "raw", self.root / "processed_md", db_path, self.config, None)
+                
+            review_files = list(self.review_dir.glob("*.md"))
+            self.assertEqual(len(review_files), 1)
+            review_file = review_files[0]
+            self.assertIn("subdomain", review_file.name)
+            self.assertIn("new_category", review_file.name)
+            
+            content = review_file.read_text(encoding="utf-8")
+            content = content.replace("status: pending", "status: accepted")
+            content = content.replace('resolution_note: ""', 'resolution_note: "Needed subdomain"')
+            review_file.write_text(content, encoding="utf-8")
+            
+            scripts.review.apply_reviews(db_path, self.root / "raw", self.root / "processed_md", self.config)
+            
+        allowed = process.parse_allowed_values(self.subdomains_file)
+        self.assertIn("Security", allowed)
+        
+        out_file = self.root / "processed_md" / "doc.md"
+        self.assertTrue(out_file.exists())
+        self.assertIn("subdomain: Security", out_file.read_text(encoding="utf-8"))
+
+    @patch("process.call_llm")
+    def test_truthness_low_score_trigger_and_resolve(self, mock_call_llm):
+        import scripts.review
+        from unittest.mock import patch, MagicMock
+        
+        raw_file = self.root / "raw" / "doc.txt"
+        raw_file.write_text("שלום עולם", encoding="utf-8")
+        
+        db_path = self.root / "pipeline.db"
+        process.init_db(db_path)
+        
+        mock_call_llm.side_effect = [
+            "Translated text",
+            "Tech",
+            "concept",
+            '{"score": 2, "justification": "unreliable source"}'
+        ]
+        
+        with patch("process.DocumentConverter") as mock_converter_cls:
+            mock_conv = MagicMock()
+            mock_conv.convert.return_value.document.export_to_markdown.return_value = "שלום עולם"
+            mock_converter_cls.return_value = mock_conv
+            
+            with self.assertRaises(process.NeedsReviewException):
+                process.process_file(raw_file, self.root / "raw", self.root / "processed_md", db_path, self.config, None)
+                
+            review_files = list(self.review_dir.glob("*.md"))
+            self.assertEqual(len(review_files), 1)
+            review_file = review_files[0]
+            self.assertIn("truthness", review_file.name)
+            self.assertIn("low_score", review_file.name)
+            
+            content = review_file.read_text(encoding="utf-8")
+            content = content.replace("status: pending", "status: accepted")
+            content = content.replace('human_answer: ""', 'human_answer: "score: 5, justification: overriding unreliable source"')
+            review_file.write_text(content, encoding="utf-8")
+            
+            scripts.review.apply_reviews(db_path, self.root / "raw", self.root / "processed_md", self.config)
+            
+        out_file = self.root / "processed_md" / "doc.md"
+        self.assertTrue(out_file.exists())
+        out_content = out_file.read_text(encoding="utf-8")
+        self.assertIn("truthness_score: 5", out_content)
+        self.assertIn("truthness_justification: \"overriding unreliable source\"", out_content)
 
 if __name__ == "__main__":
     unittest.main()
