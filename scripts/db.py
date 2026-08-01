@@ -9,6 +9,7 @@ class NeedsReviewException(Exception):
 
 def init_db(db_path: Path):
     conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
     cursor = conn.cursor()
     
     # files table

@@ -337,6 +337,7 @@ def main():
     if workers > 1:
         def run_one(fpath):
             conn = sqlite3.connect(str(db_path), timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
             try:
                 process_file(fpath, raw_root, output_root, db_path, config, force_stage, conn=conn)
                 return "success", fpath, None
@@ -371,6 +372,7 @@ def main():
                     error_count += 1
     else:
         conn = sqlite3.connect(str(db_path), timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
         try:
             for fpath in files_to_process:
                 try:
