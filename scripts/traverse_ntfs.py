@@ -58,7 +58,7 @@ def clean_extensions(ext_list: list[str] | None) -> set[str]:
     return cleaned
 
 
-def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path, dry_run: bool, existing_names: set[str] = None) -> Path | None:
+def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path, dry_run: bool, existing_names: set[str] = None, name_counters: dict = None) -> Path | None:
     """
     Copies a file to the destination directory.
     If preserve_structure is True, recreates the source relative directory path inside dest.
@@ -77,11 +77,13 @@ def copy_file(src: Path, dest: Path, preserve_structure: bool, source_root: Path
             if target_name.lower() in existing_names:
                 base = src.stem
                 suffix = src.suffix
-                counter = 1
+                counter = name_counters.get(target_name.lower(), 1) if name_counters is not None else 1
                 while True:
                     new_name = f"{base}_{counter}{suffix}"
                     if new_name.lower() not in existing_names:
                         target_name = new_name
+                        if name_counters is not None:
+                            name_counters[src.name.lower()] = counter + 1
                         break
                     counter += 1
             existing_names.add(target_name.lower())
@@ -136,6 +138,7 @@ def traverse_and_copy(
     dest_resolved = dest.resolve()
 
     existing_names = set()
+    name_counters = {}
     if not preserve_structure and dest_resolved.exists():
         try:
             existing_names = {p.name.lower() for p in dest_resolved.iterdir() if p.is_file()}
@@ -165,7 +168,8 @@ def traverse_and_copy(
                     preserve_structure=preserve_structure,
                     source_root=source_resolved,
                     dry_run=dry_run,
-                    existing_names=existing_names
+                    existing_names=existing_names,
+                    name_counters=name_counters
                 )
                 if copied:
                     copied_count += 1
