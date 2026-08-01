@@ -256,5 +256,97 @@ class TestReviewQueueAndSampling(unittest.TestCase):
         self.assertEqual(len(sample), 2)
 
 
+class TestForensics(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.raw_root = self.root / "raw"
+        self.processed_root = self.root / "processed_md"
+        self.review_dir = self.root / "review"
+        self.raw_root.mkdir()
+        self.processed_root.mkdir()
+        self.review_dir.mkdir()
+
+        self.db_path = self.root / "pipeline.db"
+        conn = sqlite3.connect(str(self.db_path))
+        conn.executescript("""
+            CREATE TABLE files (filepath TEXT PRIMARY KEY, file_hash TEXT, status TEXT);
+            CREATE TABLE stage_outputs (
+                file_hash TEXT,
+                stage_name TEXT,
+                output_text TEXT,
+                model_name TEXT,
+                instructions_hash TEXT
+            );
+        """)
+        src = self.raw_root / "doc.txt"
+        src.write_text("hello", encoding="utf-8")
+        h = _compute_file_hash(src)
+        conn.execute(
+            "INSERT INTO files (filepath, file_hash, status) VALUES (?, ?, ?)",
+            (str(src), h, "processed"),
+        )
+        conn.executemany(
+            "INSERT INTO stage_outputs (file_hash, stage_name, output_text) VALUES (?, ?, ?)",
+            [
+                (h, "docling", "extracted markdown content"),
+                (h, "translation", "translated text here"),
+                (h, "truthness", '{"score": 8, "justification": "trusted source"}'),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        # Write a processed md file
+        fm = {
+            "original_path": "doc.txt",
+            "file_hash": h,
+            "subdomain": "Tech",
+            "document_type": "concept",
+            "truthness_score": 8,
+            "truthness_justification": "trusted source",
+            "language": "english (skipped translation)",
+            "model": "llama3",
+        }
+        out = self.processed_root / "doc.md"
+        out.write_text(
+            f"---\n{yaml.safe_dump(fm, sort_keys=False)}---\n\nTranslated body text.",
+            encoding="utf-8",
+        )
+
+        # Create a review file matching this hash
+        short_hash = h[:8]
+        review_file = self.review_dir / f"doc.txt--{short_hash}--truthness--low_score.md"
+        review_file.write_text("---\nstage: truthness\n---\nReview needed", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_build_forensics_basic(self):
+        result = ep.build_forensics(
+            self.raw_root / "doc.txt",
+            self.db_path,
+            self.raw_root,
+            self.processed_root,
+            review_dir=self.review_dir,
+        )
+        self.assertEqual(result["rel_path"], "doc.txt")
+        self.assertIsNotNone(result["db_hash"])
+        self.assertIsNotNone(result["current_hash"])
+        self.assertEqual(result["stage_outputs"]["docling"]["output_text"], "extracted markdown content")
+        self.assertEqual(result["processed_frontmatter"]["subdomain"], "Tech")
+        self.assertEqual(len(result["review_files"]), 1)
+
+    def test_build_forensics_no_db_row(self):
+        result = ep.build_forensics(
+            self.raw_root / "missing.txt",
+            self.db_path,
+            self.raw_root,
+            self.processed_root,
+        )
+        self.assertIsNone(result["db_hash"])
+        self.assertEqual(result["stage_outputs"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

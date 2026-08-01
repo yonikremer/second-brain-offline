@@ -240,6 +240,60 @@ def sample_files(processed_paths: list[Path], sample_size: int, seed: int | None
     return random.sample(processed_paths, sample_size)
 
 
+def get_file_hash(db_path: Path, filepath: Path) -> str | None:
+    conn = _db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_hash FROM files WHERE filepath = ?", (str(filepath),))
+        row = cursor.fetchone()
+        return row["file_hash"] if row else None
+    finally:
+        conn.close()
+
+
+def get_stage_outputs(db_path: Path, file_hash: str) -> dict[str, dict]:
+    conn = _db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT stage_name, output_text, model_name, instructions_hash "
+            "FROM stage_outputs WHERE file_hash = ?",
+            (file_hash,),
+        )
+        return {row["stage_name"]: dict(row) for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def build_forensics(
+    raw_path: Path,
+    db_path: Path,
+    raw_root: Path,
+    processed_md_root: Path,
+    review_dir: Path | None = None,
+) -> dict:
+    file_hash = get_file_hash(db_path, raw_path)
+    rel_path = raw_path.relative_to(raw_root.resolve())
+    out_path = processed_md_root / rel_path.with_suffix(".md")
+    fm, _ = _extract_frontmatter(out_path) if out_path.exists() else (None, "")
+
+    review_files = []
+    if file_hash and review_dir is not None and review_dir.exists():
+        short_hash = file_hash[:8]
+        review_files = [str(p) for p in review_dir.glob(f"*{short_hash}*.md")]
+
+    return {
+        "raw_path": str(raw_path),
+        "processed_path": str(out_path),
+        "rel_path": str(rel_path.as_posix()),
+        "current_hash": compute_file_hash(raw_path) if raw_path.exists() else None,
+        "db_hash": file_hash,
+        "stage_outputs": get_stage_outputs(db_path, file_hash) if file_hash else {},
+        "processed_frontmatter": fm,
+        "review_files": review_files,
+    }
+
+
 def main():
     pass
 
