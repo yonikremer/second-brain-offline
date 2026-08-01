@@ -14,14 +14,11 @@ def compute_file_hash(filepath: Path) -> str:
 def get_instruction_hash(instruction_path: Path) -> str:
     if not instruction_path.exists():
         return ""
+    content = instruction_path.read_text(encoding="utf-8")
+    if "## Allowed" in content:
+        content = content.split("## Allowed")[0]
     hasher = hashlib.sha256()
-    with open(instruction_path, "rb") as f:
-        hasher.update(f.read())
-    if "translation" in instruction_path.name:
-        glossary_path = Path("glossary.md")
-        if glossary_path.exists():
-            with open(glossary_path, "rb") as f:
-                hasher.update(f.read())
+    hasher.update(content.encode("utf-8"))
     return hasher.hexdigest()
 
 def check_guid_filename_ratio(text: str, ratio: float = 0.80) -> bool:
