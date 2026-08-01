@@ -15,6 +15,7 @@ from process import (
     append_category_to_file,
     parse_allowed_values,
     STAGE_INSTRUCTIONS,
+    STAGES,
     NeedsReviewException
 )
 
@@ -77,7 +78,18 @@ def apply_reviews(db_path: Path, raw_root: Path, output_root: Path, config: dict
     if not md_files:
         print("No review files found.")
         return
-        
+
+    # Sort by pipeline stage order so upstream reviews (e.g. translation) are
+    # resolved before downstream reviews (e.g. truthness) for the same file.
+    stage_order = {stage: idx for idx, stage in enumerate(STAGES)}
+    def _stage_sort_key(p: Path) -> int:
+        try:
+            data = parse_review_file(p)
+            return stage_order.get(data.get("stage", ""), len(STAGES))
+        except Exception:
+            return len(STAGES)
+    md_files.sort(key=_stage_sort_key)
+
     resolved_count = 0
     for p in md_files:
         try:
@@ -116,7 +128,24 @@ def apply_reviews(db_path: Path, raw_root: Path, output_root: Path, config: dict
                 continue
                 
             print(f"\nApplying review decision: {status.upper()} for stage '{stage}' ({p.name})")
-            
+
+            # Validate accepted reviews have a non-empty human answer where required.
+            # Truthness may be empty (defaults to score 10). New category falls back
+            # to the LLM's proposed value. Clarification has no fallback, so reject.
+            if status == "accepted" and not human_answer:
+                if stage == "translation" and trigger == "clarification":
+                    print(f"    [Warning] Accepted clarification review has empty human_answer. Treating as rejected.")
+                    status = "rejected"
+                    resolution_note = (resolution_note + " " if resolution_note else "") + "Empty human_answer; treated as rejected."
+                elif stage in ("subdomain", "doc_type") and trigger == "new_category":
+                    if proposed_answer:
+                        print(f"    [Warning] Accepted new_category review has empty human_answer. Using proposed answer '{proposed_answer}'.")
+                        human_answer = proposed_answer
+                    else:
+                        print(f"    [Warning] Accepted new_category review has empty human_answer and no proposed answer. Treating as rejected.")
+                        status = "rejected"
+                        resolution_note = (resolution_note + " " if resolution_note else "") + "Empty human_answer; treated as rejected."
+
             if status == "accepted":
                 if stage == "translation" and trigger == "clarification":
                     context_data = json.loads(context_json)

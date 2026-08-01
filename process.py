@@ -11,6 +11,7 @@ from pathlib import Path
 from docling.document_converter import DocumentConverter
 from openai import OpenAI
 import xml.etree.ElementTree as ET
+import yaml
 
 # Pipeline sequence
 STAGES = ["docling", "filtering", "translation", "subdomain", "doc_type", "truthness"]
@@ -146,12 +147,12 @@ def trigger_review(db_path: Path, filepath: Path, file_hash: str, stage: str, tr
         elif trigger_type == "parse_failure":
             context_data = json.loads(context_json)
             raw_resp = context_data.get("raw_response", "")
-            body = f'## Raw LLM Response\n```json\n{raw_resp}\n```'
+            body = f'## Raw LLM Response\n```json\n{raw_resp}\n```\n\n## Expected answer format\nProvide your expert assessment as JSON:\n```json\n{{"score": 9, "justification": "Your reasoning here"}}\n```\nOr as plain text: `score: 9, justification: Your reasoning here`\n\nIf you accept without specifying a score, it will default to **10** (highest trust).'
         elif trigger_type == "low_score":
             context_data = json.loads(context_json)
             parsed_score = context_data.get("parsed_score", "")
             parsed_just = context_data.get("parsed_justification", "")
-            body = f'## Score\n{parsed_score}\n\n## Justification\n{parsed_just}'
+            body = f'## Score\n{parsed_score}\n\n## Justification\n{parsed_just}\n\n## Expected answer format\nProvide your expert assessment as JSON:\n```json\n{{"score": 9, "justification": "Your reasoning here"}}\n```\nOr as plain text: `score: 9, justification: Your reasoning here`\n\nIf you accept without specifying a score, it will default to **10** (highest trust).'
 
         title_map = {
             "clarification": "Translation Clarification",
@@ -161,17 +162,25 @@ def trigger_review(db_path: Path, filepath: Path, file_hash: str, stage: str, tr
         }
         title = title_map.get(trigger_type, "Review Needed")
 
+        frontmatter = {
+            "queue_id": queue_id,
+            "file_hash": file_hash,
+            "filepath": display_path,
+            "stage": stage,
+            "trigger": trigger_type,
+            "status": "pending",
+            "proposed_answer": proposed_answer or "",
+            "human_answer": "",
+            "resolution_note": "",
+        }
+        fm_text = yaml.safe_dump(
+            frontmatter,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
         content = f"""---
-queue_id: {queue_id}
-file_hash: {file_hash}
-filepath: {display_path}
-stage: {stage}
-trigger: {trigger_type}
-status: pending
-proposed_answer: "{proposed_answer.replace('"', '\\"')}"
-human_answer: ""
-resolution_note: ""
----
+{fm_text}---
 
 # Review Needed: {title}
 
@@ -469,55 +478,6 @@ def append_category_to_file(instr_path: Path, val: str, focus: str):
         lines[allowed_start_idx:allowed_end_idx] = cleaned_allowed_lines
         
     instr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-def verify_or_update_category(stage_name: str, val: str, instr_path: Path) -> str:
-    allowed_values = parse_allowed_values(instr_path)
-    val_clean = val.strip()
-    
-    matched = None
-    for allowed in allowed_values:
-        if val_clean.lower() == allowed.lower():
-            matched = allowed
-            break
-            
-    if matched:
-        return matched
-        
-    print(f"\n    [New {stage_name} Detected] LLM returned: '{val_clean}'")
-    print(f"    Current allowed values: {allowed_values}")
-    
-    if not sys.stdin.isatty():
-        print(f"    [Warning] Non-interactive environment. Accepting LLM value: '{val_clean}'")
-        append_category_to_file(instr_path, val_clean, f"Added automatically in non-interactive run.")
-        return val_clean
-
-    user_choice = input(f"Is '{val_clean}' a new {stage_name}? (y/n): ").strip().lower()
-    if user_choice in ("y", "yes"):
-        focus = input(f"Provide a short description/focus for '{val_clean}': ").strip()
-        append_category_to_file(instr_path, val_clean, focus)
-        print(f"    [Updated] Added '{val_clean}' to {instr_path.name}")
-        return val_clean
-    else:
-        print("Please choose one of the existing allowed values:")
-        for idx, allowed in enumerate(allowed_values, 1):
-            print(f"  {idx}. {allowed}")
-        while True:
-            selection = input(f"Enter number (1-{len(allowed_values)}) or type a custom value: ").strip()
-            if not selection:
-                continue
-            if selection.isdigit():
-                sel_idx = int(selection) - 1
-                if 0 <= sel_idx < len(allowed_values):
-                    return allowed_values[sel_idx]
-            confirm = input(f"Use custom value '{selection}'? (y/n): ").strip().lower()
-            if confirm in ("y", "yes"):
-                for allowed in allowed_values:
-                    if selection.lower() == allowed.lower():
-                        return allowed
-                focus = input(f"Provide a short description/focus for '{selection}': ").strip()
-                append_category_to_file(instr_path, selection, focus)
-                print(f"    [Updated] Added '{selection}' to {instr_path.name}")
-                return selection
 
 def call_llm(config: dict, system_prompt: str, user_prompt: str) -> str:
     api_base = config["llm"]["api_base"]
@@ -913,7 +873,7 @@ def process_file(
             orig_just = truthness_data.get("justification", "")
         except Exception:
             pass
-        score, justification = parse_truthness_human_answer(human_ans, orig_score, orig_just)
+        score, justification = parse_truthness_human_answer(human_ans, 10, orig_just)
         print(f"    [Truthness Override] Applying human review decision: score={score}")
     else:
         try:

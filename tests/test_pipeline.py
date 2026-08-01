@@ -1,6 +1,7 @@
 # tests/test_pipeline.py
 import unittest
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -297,9 +298,9 @@ class TestInteractiveTranslation(unittest.TestCase):
             
             # Simulate human response
             content = review_file.read_text(encoding="utf-8")
-            content = content.replace('status: pending', 'status: accepted')
-            content = content.replace('human_answer: ""', 'human_answer: "Hello"')
-            content = content.replace('resolution_note: ""', 'resolution_note: "Greeting notes"')
+            content = re.sub(r"^status:.*$", "status: accepted", content, flags=re.MULTILINE)
+            content = re.sub(r"^human_answer:.*$", 'human_answer: "Hello"', content, flags=re.MULTILINE)
+            content = re.sub(r"^resolution_note:.*$", 'resolution_note: "Greeting notes"', content, flags=re.MULTILINE)
             review_file.write_text(content, encoding="utf-8")
             
             # Call apply_reviews from scripts.review
@@ -497,39 +498,6 @@ class TestCategoryVerification(unittest.TestCase):
         content = subdomains_file.read_text(encoding="utf-8")
         self.assertIn("1. **AI**", content)
         self.assertIn("2. **DevOps**", content)
-        
-    @patch("sys.stdin.isatty", return_value=True)
-    @patch("process.input")
-    def test_verify_or_update_category_interactive_yes(self, mock_input, mock_isatty):
-        doc_types_file = self.tmp_path / "document_types.md"
-        doc_types_file.write_text(
-            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n\n## Output Format\n",
-            encoding="utf-8"
-        )
-        
-        # Simulate user saying "yes, this is new" and providing description
-        mock_input.side_effect = ["y", "New description of how-to-guide"]
-        
-        val = process.verify_or_update_category("doc_type", "how-to-guide", doc_types_file)
-        self.assertEqual(val, "how-to-guide")
-        
-        allowed = process.parse_allowed_values(doc_types_file)
-        self.assertEqual(allowed, ["concept", "how-to-guide"])
-        
-    @patch("sys.stdin.isatty", return_value=True)
-    @patch("process.input")
-    def test_verify_or_update_category_interactive_no_then_choose(self, mock_input, mock_isatty):
-        doc_types_file = self.tmp_path / "document_types.md"
-        doc_types_file.write_text(
-            "# Title\n\n## Allowed Document Types\n\n1. **concept**\n   - Focus: A concept\n2. **other**\n   - Focus: Other\n\n## Output Format\n",
-            encoding="utf-8"
-        )
-        
-        # Simulate user saying "no, not new", then selecting index 2 ("other")
-        mock_input.side_effect = ["n", "2"]
-        
-        val = process.verify_or_update_category("doc_type", "unknown-type", doc_types_file)
-        self.assertEqual(val, "other")
 
 class TestHumanReviewQueueFlow(unittest.TestCase):
     def setUp(self):
@@ -664,8 +632,8 @@ class TestHumanReviewQueueFlow(unittest.TestCase):
             self.assertIn("low_score", review_file.name)
             
             content = review_file.read_text(encoding="utf-8")
-            content = content.replace("status: pending", "status: accepted")
-            content = content.replace('human_answer: ""', 'human_answer: "score: 5, justification: overriding unreliable source"')
+            content = re.sub(r"^status:.*$", "status: accepted", content, flags=re.MULTILINE)
+            content = re.sub(r"^human_answer:.*$", 'human_answer: "score: 5, justification: overriding unreliable source"', content, flags=re.MULTILINE)
             review_file.write_text(content, encoding="utf-8")
             
             scripts.review.apply_reviews(db_path, self.root / "raw", self.root / "processed_md", self.config)
