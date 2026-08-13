@@ -54,20 +54,28 @@ def _load_translation(path: Path) -> tuple[dict, str]:
     return meta, body
 
 
+def _read_csv_skip_comments(path: Path) -> list[str]:
+    """Strip # comment and empty lines before DictReader (matches check_glossary)."""
+    text = path.read_text(encoding="utf-8")
+    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
 def load_glossary_terms(glossary_path: Path) -> dict[str, str]:
     """term_he -> english (approved only)."""
     terms: dict[str, str] = {}
     if glossary_path.exists():
-        with open(glossary_path, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames:
-                for row in reader:
-                    if (row.get("status") or "").strip() not in ("approved", "keep_source"):
-                        continue
-                    he = (row.get("term_he") or "").strip()
-                    en = (row.get("english") or "").strip()
-                    if he and en:
-                        terms[he] = en
+        lines = _read_csv_skip_comments(glossary_path)
+        if not lines:
+            return terms
+        reader = csv.DictReader(lines)
+        if reader.fieldnames:
+            for row in reader:
+                if (row.get("status") or "").strip() not in ("approved", "keep_source"):
+                    continue
+                he = (row.get("term_he") or "").strip()
+                en = (row.get("english") or "").strip()
+                if he and en:
+                    terms[he] = en
     return terms
 
 
@@ -91,8 +99,16 @@ def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: d
     for he, en in glossary_terms.items():
         docs_with_marker = []
         for path, body in translations:
-            if f"⟦he:{he}⟧" in body or f"⟦he:{he}" in body:
-                docs_with_marker.append(path.name)
+            # Multi-word terms are marked per-word (⟦he:בינה⟧ ⟦he:מלאכותית⟧), so check all tokens
+            if " " in he:
+                tokens = he.split()
+                single_marker = f"⟦he:{he}⟧"
+                per_word_present = all(f"⟦he:{tok}⟧" in body for tok in tokens)
+                if per_word_present or single_marker in body or f"⟦he:{he}" in body:
+                    docs_with_marker.append(path.name)
+            else:
+                if f"⟦he:{he}⟧" in body or f"⟦he:{he}" in body:
+                    docs_with_marker.append(path.name)
         if len(docs_with_marker) >= 2:
             flags.append({
                 "type": "glossary_consistency",

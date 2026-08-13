@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -99,7 +100,26 @@ def cmd_parse(csv_path: Path, ledger_path: Path | None, dry_run: bool = False):
 
     if ledger_path:
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        # Compute glossary_version from glossary.csv next to ledger or sibling
         glossary_version = ""
+        glossary_candidates = [
+            ledger_path.parents[1] / "domain_terms" / "glossary.csv",
+            ledger_path.parent.parent / "domain_terms" / "glossary.csv",
+        ]
+        # vault_root derived from ledger_path: vault/data/translations/ledger.jsonl -> vault = parents[2]
+        try:
+            vault_from_ledger = ledger_path.parents[2] if len(ledger_path.parents) >= 3 else None
+            if vault_from_ledger is not None:
+                glossary_candidates.insert(0, vault_from_ledger / "data" / "domain_terms" / "glossary.csv")
+        except Exception:
+            pass
+        for cand in glossary_candidates:
+            if cand.exists():
+                try:
+                    glossary_version = hashlib.sha256(cand.read_bytes()).hexdigest()[:10]
+                except OSError:
+                    pass
+                break
         # Derive glossary_version if glossary exists next to ledger
         for r in rows:
             if (r.get("status") or "").strip() in ("approved", "keep_source"):
@@ -161,7 +181,7 @@ def main(argv=None):
         # Canonical ledger: <vault>/data/translations/ledger.jsonl
         if ledger is None:
             try:
-                vault_root = args.csv.resolve().parents[1]
+                vault_root = args.csv.resolve().parents[2]
                 candidate = get_ledger_path(vault_root)
                 # Fallback to old sibling heuristic if vault layout not detected
                 if not candidate.parent.exists():

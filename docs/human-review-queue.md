@@ -18,7 +18,7 @@ Single queue for Hebrew→English translation: glossary and translation question
 
 - **Source of truth:** `data/review_queue/review_queue.csv`
 - Columns: `term_he,english,keep_source,notes,status,example_doc,context_snippets,occurrences,blocked_docs,question_id`
-- Status enum: `approved | proposed | keep_source | pending`
+- Status enum: `approved | proposed | keep_source | pending` — `pending` is review-queue-only interim (not valid in `data/domain_terms/glossary.csv`; `check_glossary.py` treats `pending` as unapproved and blocks translation).
 
 ## Workflow
 

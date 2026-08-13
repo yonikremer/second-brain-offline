@@ -83,17 +83,22 @@ def resolve_corpus_dir(vault_root: Path, explicit: Path | None = None) -> Path:
     sys.exit(1)
 
 
+def _read_csv_skip_comments(path: Path) -> list[str]:
+    """Read CSV text stripping # comment and empty lines (matches check_glossary)."""
+    text = path.read_text(encoding="utf-8")
+    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
 def load_glossary(glossary_path: Path) -> list[dict]:
     if not glossary_path.exists():
         return []
-    rows = []
-    with open(glossary_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            return []
-        for r in reader:
-            rows.append(r)
-    return rows
+    lines = _read_csv_skip_comments(glossary_path)
+    if not lines:
+        return []
+    reader = csv.DictReader(lines)
+    if not reader.fieldnames:
+        return []
+    return list(reader)
 
 
 def load_person_names(vault_root: Path) -> tuple[set[str], set[str]]:
@@ -178,7 +183,7 @@ def _mask_via_tokens(text: str, name_to_sentinel: dict[str, str]) -> str:
         bg = f"{he_spans[i][2]} {he_spans[i + 1][2]}"
         if bg in bigram_set:
             sep = text[he_spans[i][1]: he_spans[i + 1][0]]
-            if sep == "" or sep.isspace():
+            if sep in ("", " ", "\t", "\n", "־", "-", "־"):
                 replacements[i] = name_to_sentinel[bg]
                 skip.add(i + 1)
 
@@ -300,13 +305,15 @@ def chunk_markdown(md_text: str, max_chars: int = 6000) -> list[dict]:
 
 
 def glossary_for_chunk(chunk_text: str, glossary: list[dict]) -> list[dict]:
-    """Filter glossary to entries whose term_he occurs in chunk (case for Hebrew = substring).
+    """Filter glossary to entries whose term_he occurs in chunk at word boundaries.
 
     Only terms with status 'approved' or 'keep_source' are injected — 'proposed'
-    rows must not leak into prompts.
+    rows must not leak into prompts. Uses token-boundary matching to avoid
+    injecting מודל when chunk contains only מודלים.
     """
-    low = chunk_text  # Hebrew is caseless; substring match
     relevant = []
+    he_tokens = set(re.findall(r"[א-ת]+", chunk_text))
+    has_hebrew = re.compile(r"[א-ת]")
     for row in glossary:
         term = (row.get("term_he") or "").strip()
         if not term:
@@ -314,7 +321,16 @@ def glossary_for_chunk(chunk_text: str, glossary: list[dict]) -> list[dict]:
         status = (row.get("status") or "approved").strip()
         if status not in ("approved", "keep_source"):
             continue
-        if term in low:
+        # Fast path: exact token match for single-token Hebrew terms
+        if " " not in term and term in he_tokens:
+            relevant.append(row)
+            continue
+        # Boundary-aware regex: require word boundaries so substring inside longer word doesn't match
+        if has_hebrew.search(term):
+            pat = r"(?<![א-ת])" + re.escape(term) + r"(?![א-ת])"
+        else:
+            pat = r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])"
+        if re.search(pat, chunk_text):
             relevant.append(row)
     return relevant
 

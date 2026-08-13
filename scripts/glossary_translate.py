@@ -48,6 +48,7 @@ def resolve_corpus_dir(vault_root: Path) -> Path | None:
         p = vault_root / name
         if p.is_dir() and any(p.rglob("*.md")):
             return p
+    print(f"WARN: no corpus dir (raw_md/ or raw/ with *.md) under {vault_root} — proceeding without contexts", file=sys.stderr)
     return None
 
 
@@ -66,8 +67,10 @@ def _strip_md(text: str) -> str:
 
 def harvest_contexts(corpus_dir: Path, terms: list[str], per_term: int = 3) -> dict[str, list[str]]:
     """Mine 2-3 real sentences per term from corpus (deterministic, no LLM)."""
+    # Deduplicate input terms to avoid collapsing term_lower keys
+    unique_terms = list(dict.fromkeys(terms))  # preserves order, deduped
     # Build lowercase term -> original term mapping for matching
-    term_lower = {t.lower(): t for t in terms}
+    term_lower = {t.lower(): t for t in unique_terms}
     # Also map variant surfaces: we'll just search for normalized term substring in body lower
     result: dict[str, list[str]] = {t: [] for t in terms}
 
@@ -184,13 +187,23 @@ def main(argv=None):
     if not args.mock and not base_url:
         print("ERROR: translation base_url missing. Set TRANSLATE_BASE_URL or QMD_OPENAI_BASE_URL or convert_config.json translation.base_url", file=sys.stderr)
         sys.exit(1)
+    # api_key may be empty for no-auth gateways; call_llm handles it (auth header with empty key is ok)
 
-    # Read seed
+    # Read seed (strip # comment / empty lines like check_glossary)
     seed_rows: list[dict] = []
-    with open(input_csv, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            seed_rows.append(row)
+    text = input_csv.read_text(encoding="utf-8")
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    if not lines:
+        print("translation_seed.csv has no rows — nothing to translate (empty corpus or all terms filtered)", file=sys.stderr)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["term_he", "english", "keep_source", "notes", "status", "example_doc", "context_snippets", "lang", "model"])
+            w.writeheader()
+        print(f"Wrote header-only glossary to {out_csv}")
+        sys.exit(0)
+    reader = csv.DictReader(lines)
+    for row in reader:
+        seed_rows.append(row)
     if not seed_rows:
         print("translation_seed.csv has no rows — nothing to translate (empty corpus or all terms filtered)", file=sys.stderr)
         # Still write header-only output so downstream doesn't break
