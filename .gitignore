@@ -1,7 +1,10 @@
-.DS_Store
 .obsidian/
+.DS_Store
+graphify-out/.graphify_*
 __pycache__/
 *.pyc
+.qmd/*.sqlite*
+.idea
 
 # Build / docs output
 dist/
@@ -17,3 +20,32 @@ site/
 **/.vault-framework-backup/
 
 **/graphify-out/.graphify_*
+
+# Offline docling models — selectable-text bundle (506 MB). Re-vendor via:
+# python scripts/download_docling_models.py && python scripts/package_docling_offline_bundle.py
+# Transfer once through the gap; distribute inside via NFS/S3.
+/deps/docling-models/
+/deps/tessdata/
+
+# OneNote offline - .NET build outputs (self-contained publish ~76MB, local only)
+scripts/OneNoteOffline/bin/
+scripts/OneNoteOffline/obj/
+scripts/OneNoteOffline/publish/
+
+# Waived derived artifacts (not part of vault 3-layer model)
+# data/domain_terms/glossary.csv IS committed as a template (headers + example row).
+/raw_md/
+data/domain_terms/*
+!data/domain_terms/glossary.csv
+data/hebrew_dict.json
+data/translations/
+data/review_queue/
+.campaigns/
+campaigns/
+data/hot_words.csv
+
+# Large raw allowlist data (generated, not committed)
+/data/person_names/first_names_full.txt
+/data/person_names/first_names_raw.json
+/data/person_names/first_names_raw.csv
+/data/person_names/faker_first.json
