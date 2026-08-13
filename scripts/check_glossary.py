@@ -12,7 +12,7 @@ import csv
 import sys
 from pathlib import Path
 
-VALID_STATUSES = {"approved", "proposed", "keep_source"}
+VALID_STATUSES = {"approved", "proposed", "keep_source", "pending"}
 REQUIRED_COLUMNS = {"term_he", "status"}
 
 
@@ -27,9 +27,10 @@ def check_glossary(path: Path) -> tuple[bool, list[str]]:
     except OSError as e:
         return False, [f"cannot read glossary: {e}"]
 
-    # Strip empty / comment lines but let csv handle the rest
+    # Strip empty / comment lines (plan template has '# ...' comment lines)
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
     try:
-        reader = csv.DictReader(text.splitlines())
+        reader = csv.DictReader(lines)
     except Exception as e:
         return False, [f"csv parse error: {e}"]
 

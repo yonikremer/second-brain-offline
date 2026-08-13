@@ -2,7 +2,6 @@
 
 ## Files
 - `first_names.txt` (592) - curated common Hebrew first names for LLM guard (keep in Hebrew). Sources: faker-js he/person/first_name.ts (539, https://github.com/faker-js/faker) + manual Israeli common names + Arab-Israeli names (מוחמד, אחמד...). Sorted alphabetically, UTF-8.
-- `first_names_curated.txt` - duplicate of above
 - `first_names_full.txt` (107,793) - full pure-Hebrew registry from data.gov.il dataset `firs-name` (https://data.gov.il/dataset/firs-name, 116,673 records, updated 2020-09-14, via datastore API). Filtered to Hebrew letters+space only. Keep for recall, use curated for precision.
 - `last_names.txt` (818, alphabetical) + `last_names_ranked.txt` (818, frequency-ranked - Wikipedia 30 first, then rest)
   Sources:

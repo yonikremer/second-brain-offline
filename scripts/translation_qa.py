@@ -87,18 +87,20 @@ def check_glossary_retention(body: str, glossary: list[dict]) -> dict:
     for row in glossary:
         eng = (row.get("english") or "").strip()
         status = (row.get("status") or "").strip()
-        if not eng or status not in ("approved", "keep_source"):
+        term_he = (row.get("term_he") or "").strip()
+        if status not in ("approved", "keep_source"):
             continue
-        # Approved glossary English should appear if the Hebrew term was in source;
-        # we approximate: if eng is non-trivial (>3 chars) and expected, check presence
-        # For keep_source, the Hebrew should be preserved — check thatMarker or original present
         if status == "keep_source":
-            term = (row.get("term_he") or "").strip()
-            if term and term not in body:
-                # keep_source term should still be in Hebrew form somewhere
-                violations.append(f"keep_source missing: {term!r}")
-        # For normal approved, we just ensure eng appears OR marker exists (blocked case)
-        # So only flag if body has neither eng nor he marker for that term
+            if term_he and term_he not in body:
+                violations.append(f"keep_source missing: {term_he!r}")
+        elif status == "approved":
+            if not eng:
+                continue
+            # Approved term: translation body must contain the English rendering
+            # or an explicit ⟦he:term_he⟧ marker signalling blocked translation.
+            marker = f"⟦he:{term_he}⟧"
+            if eng not in body and marker not in body:
+                violations.append(f"approved term {term_he!r} -> {eng!r} not found in translation")
     return {
         "check": "glossary_retention",
         "status": "fail" if violations else "pass",
@@ -151,6 +153,13 @@ def check_numeric_fidelity(source_body: str, trans_body: str) -> dict:
 
 
 def check_length_ratio(source_body: str, trans_body: str, low: float = 0.5, high: float = 2.5) -> dict:
+    """Translation length vs source char-count ratio.
+
+    NOTE: [0.5, 2.5] are pre-calibration placeholders. Fit from 3-5 approved
+    reference translations in Phase 0 (see hebrew-translation-pipeline.md §6)
+    and override via config if QA bands drift. Emits no warning by default;
+    if QA config not found the defaults are used as-is.
+    """
     s = len(source_body)
     t = len(trans_body)
     ratio = t / max(s, 1)
@@ -239,6 +248,7 @@ def main(argv=None):
         sys.exit(1)
 
     failures = 0
+    per_doc: list[dict] = []
     for trans_path in translations:
         meta, body = _load_translation(trans_path)
         # Try to resolve source path
@@ -258,6 +268,7 @@ def main(argv=None):
                         break
 
         checks = run_all(source_path, body, meta, glossary)
+        per_doc.append({"file": trans_path.relative_to(store_dir).as_posix(), "meta": meta, "checks": checks})
         quarantined = any(c["status"] == "fail" for c in checks)
         rel = trans_path.relative_to(store_dir).as_posix()
         status = "QUARANTINE" if quarantined else "PASS"
@@ -269,22 +280,12 @@ def main(argv=None):
         if quarantined:
             failures += 1
 
-        if args.json_out:
-            out_path = args.json_out
-            # Append
-
     print(f"\nQA: {len(translations)} docs, {failures} quarantined")
 
     if args.json_out:
-        # Write summary
-        import json as _json
-        # Re-run to collect
-        summary = []
-        for trans_path in translations:
-            meta, body = _load_translation(trans_path)
-            summary.append({"file": trans_path.relative_to(store_dir).as_posix(), "meta": meta, "checks": "see above"})
-        # Not writing per-doc JSON by default; summary placeholder
-        print(f"(json-out not yet per-doc; use --json-out for future detailed output)")
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(per_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Wrote per-doc report to {args.json_out}")
 
     sys.exit(1 if failures else 0)
 

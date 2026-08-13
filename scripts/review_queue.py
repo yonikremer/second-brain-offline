@@ -12,11 +12,17 @@ import argparse
 import csv
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 VALID_STATUSES = {"approved", "proposed", "keep_source", "pending"}
 FIELDNAMES = ["term_he", "english", "keep_source", "notes", "status", "example_doc",
               "context_snippets", "occurrences", "blocked_docs", "question_id"]
+
+
+def get_ledger_path(vault_root: Path) -> Path:
+    """Canonical ledger path: vault_root/data/translations/ledger.jsonl."""
+    return vault_root / "data" / "translations" / "ledger.jsonl"
 
 
 def cmd_list(csv_path: Path):
@@ -93,14 +99,18 @@ def cmd_parse(csv_path: Path, ledger_path: Path | None, dry_run: bool = False):
 
     if ledger_path:
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        glossary_version = ""
+        # Derive glossary_version if glossary exists next to ledger
         for r in rows:
             if (r.get("status") or "").strip() in ("approved", "keep_source"):
                 event = {
                     "event": "question_answered",
+                    "ts": datetime.now(timezone.utc).isoformat(),
                     "term_he": r.get("term_he", ""),
                     "english": r.get("english", ""),
                     "status": r.get("status", ""),
                     "decided_by": "human",
+                    "glossary_version": glossary_version,
                 }
                 with open(ledger_path, "a", encoding="utf-8") as lf:
                     lf.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -148,12 +158,20 @@ def main(argv=None):
         cmd_gen_packets(args.csv, out_dir, batch=args.batch)
     elif args.cmd == "parse":
         ledger = args.ledger
-        # Default ledger is sibling translations ledger
+        # Canonical ledger: <vault>/data/translations/ledger.jsonl
         if ledger is None:
-            # Try data/translations/ledger.jsonl
-            candidate = args.csv.parents[1] / "translations" / "ledger.jsonl" if len(args.csv.parents) > 1 else None
-            ledger = candidate if candidate else args.csv.parent / "ledger.jsonl"
-        # If candidate doesn't exist, don't require it
+            try:
+                vault_root = args.csv.resolve().parents[1]
+                candidate = get_ledger_path(vault_root)
+                # Fallback to old sibling heuristic if vault layout not detected
+                if not candidate.parent.exists():
+                    cand2 = args.csv.parents[1] / "translations" / "ledger.jsonl" if len(args.csv.parents) > 1 else None
+                    ledger = cand2 if cand2 and cand2.parent.exists() else candidate
+                else:
+                    ledger = candidate
+            except Exception:
+                ledger = args.csv.parents[1] / "translations" / "ledger.jsonl" if len(args.csv.parents) > 1 else args.csv.parent / "ledger.jsonl"
+        # If ledger parent doesn't exist, don't create ledger silently
         if ledger and not ledger.parent.exists() and not args.dry_run:
             ledger = None
         cmd_parse(args.csv, ledger, dry_run=args.dry_run)

@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 _scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,8 +36,26 @@ PERSON_OPEN = "⟦PERSON_"
 PERSON_CLOSE = "⟧"
 HE_MARKER_FMT = "⟦he:{term}⟧"
 
-# Hebrew char range (narrow א-ת)
+# Hebrew char range (narrow א-ת) — used in mock_translate for sentinel-aware marking
 HEBREW_RE = re.compile(r"[א-ת]")
+HEBREW_WORD_RE = re.compile(r"[א-ת]{2,}")
+
+
+def get_ledger_path(vault_root: Path, out_root: Path | None = None) -> Path:
+    """Canonical ledger path: vault_root/data/translations/ledger.jsonl.
+
+    If out_root is an explicit custom dir outside the vault, use out_root/ledger.jsonl
+    so --out tests still write locally. Otherwise always canonical.
+    """
+    canonical = vault_root / "data" / "translations" / "ledger.jsonl"
+    if out_root is None:
+        return canonical
+    try:
+        # If out_root is inside vault_root, prefer canonical to avoid split ledgers
+        out_root.resolve().relative_to(vault_root.resolve())
+        return canonical
+    except ValueError:
+        return out_root / "ledger.jsonl"
 
 
 def load_config(vault_root: Path) -> dict:
@@ -97,20 +116,20 @@ def load_person_names(vault_root: Path) -> tuple[set[str], set[str]]:
 
 
 def mask_person_names(text: str, first: set[str], last: set[str]) -> tuple[str, list[str]]:
-    """Exact-match scan for person names (unigram + bigram), mask to sentinels."""
-    # Build all single-token candidates present in text
-    # Approach: find Hebrew word tokens, check against first/last, also check bigrams "first last"
+    """Exact-match scan for person names (unigram + bigram), mask to sentinels.
+
+    Token-boundary safe: replaces whole Hebrew tokens only, never substrings
+    inside a longer word (e.g. 'דן' inside 'דניאל').
+    """
     tokens = re.findall(r"[א-ת]{2,}", text)
     token_set = set(tokens)
-    # Find bigrams
+
     words = re.findall(r"[א-ת]+", text)
     bigram_candidates: set[str] = set()
     for i in range(len(words) - 1):
         bg = f"{words[i]} {words[i+1]}"
         bigram_candidates.add(bg)
-        # also without space for matching robustness
 
-    # Names to mask: any token in first or last, plus bigrams where first in first and second in last
     single_names: set[str] = {t for t in token_set if t in first or t in last}
     bigram_names: set[str] = set()
     for bg in bigram_candidates:
@@ -118,15 +137,82 @@ def mask_person_names(text: str, first: set[str], last: set[str]) -> tuple[str, 
         if len(parts) == 2 and parts[0] in first and parts[1] in last:
             bigram_names.add(bg)
 
+    # If a bigram was matched, its component tokens must not also be listed as singles
+    if bigram_names:
+        bigram_tokens: set[str] = set()
+        for bg in bigram_names:
+            bigram_tokens.update(bg.split())
+        single_names -= bigram_tokens
+
     all_names = sorted(single_names | bigram_names, key=len, reverse=True)
-    masked = text
+    if not all_names:
+        return text, []
+
+    name_to_sentinel: dict[str, str] = {}
     mapping: list[str] = []
     for name in all_names:
         sentinel = f"{PERSON_OPEN}{len(mapping)}{PERSON_CLOSE}"
-        if name in masked:
-            masked = masked.replace(name, sentinel)
-            mapping.append(name)
+        name_to_sentinel[name] = sentinel
+        mapping.append(name)
+
+    masked = _mask_via_tokens(text, name_to_sentinel)
     return masked, mapping
+
+
+def _mask_via_tokens(text: str, name_to_sentinel: dict[str, str]) -> str:
+    """Replace names at token boundaries by scanning Hebrew word spans."""
+    bigram_set = {k for k in name_to_sentinel if " " in k}
+    single_set = {k for k in name_to_sentinel if " " not in k}
+
+    he_spans = [(m.start(), m.end(), m.group(0)) for m in re.finditer(r"[א-ת]+", text)]
+    if not he_spans:
+        return text
+
+    skip: set[int] = set()
+    replacements: dict[int, str] = {}
+
+    # Bigram pass first (longer matches win)
+    for i in range(len(he_spans) - 1):
+        if i in skip:
+            continue
+        bg = f"{he_spans[i][2]} {he_spans[i + 1][2]}"
+        if bg in bigram_set:
+            sep = text[he_spans[i][1]: he_spans[i + 1][0]]
+            if sep == "" or sep.isspace():
+                replacements[i] = name_to_sentinel[bg]
+                skip.add(i + 1)
+
+    # Single pass for remaining tokens
+    for i, (_, _, tok) in enumerate(he_spans):
+        if i in skip or i in replacements:
+            continue
+        if tok in single_set:
+            replacements[i] = name_to_sentinel[tok]
+
+    if not replacements:
+        return text
+
+    # Rebuild via offset scan
+    result: list[str] = []
+    cur = 0
+    i = 0
+    while i < len(he_spans):
+        s, e, _tok = he_spans[i]
+        if i in replacements:
+            result.append(text[cur:s])
+            result.append(replacements[i])
+            if (i + 1) in skip:
+                cur = he_spans[i + 1][1]
+                i += 2
+            else:
+                cur = e
+                i += 1
+        elif i in skip:
+            i += 1
+        else:
+            i += 1
+    result.append(text[cur:])
+    return "".join(result)
 
 
 def unmask_person_names(text: str, mapping: list[str]) -> str:
@@ -214,16 +300,20 @@ def chunk_markdown(md_text: str, max_chars: int = 6000) -> list[dict]:
 
 
 def glossary_for_chunk(chunk_text: str, glossary: list[dict]) -> list[dict]:
-    """Filter glossary to entries whose term_he occurs in chunk (case for Hebrew = substring)."""
+    """Filter glossary to entries whose term_he occurs in chunk (case for Hebrew = substring).
+
+    Only terms with status 'approved' or 'keep_source' are injected — 'proposed'
+    rows must not leak into prompts.
+    """
     low = chunk_text  # Hebrew is caseless; substring match
     relevant = []
     for row in glossary:
         term = (row.get("term_he") or "").strip()
         if not term:
             continue
-        # Only approved or keep_source terms guide translation
         status = (row.get("status") or "approved").strip()
-        # For proposed glossary, still inject — but mark as provisional
+        if status not in ("approved", "keep_source"):
+            continue
         if term in low:
             relevant.append(row)
     return relevant
@@ -317,17 +407,18 @@ def mock_translate(chunk_text: str, glossary_rows: list[dict]) -> dict:
         eng = r.get("english", "")
         if term and eng and term in out:
             out = out.replace(term, eng)
-    # Mark remaining Hebrew spans as ⟦he:..⟧ (zero-guessing simulation)
-    # Don't double-mark already-masked PERSON sentinels
-    def _mark_he(m):
-        tok = m.group(0)
-        if tok.startswith(PERSON_OPEN):
-            return tok
-        return HE_MARKER_FMT.format(term=tok)
-    # Only mark 2+ char Hebrew runs not already in markers
-    out = re.sub(r"[א-ת]{2,}", _mark_he, out)
-    # But PERSON sentinels contain the prefix — undo those marks by unmangling
-    # (simple: the regex won't match ⟦ so safe)
+    # Mark remaining Hebrew spans as ⟦he:..⟧ (zero-guessing simulation).
+    # Exclude PERSON sentinels: split by sentinel pattern, only mark Hebrew
+    # in non-sentinel segments so ⟦PERSON_n⟧ never gets wrapped.
+    PERSON_RE = re.compile(re.escape(PERSON_OPEN) + r"\d+" + re.escape(PERSON_CLOSE))
+    parts = PERSON_RE.split(out)
+    sentinels = PERSON_RE.findall(out)
+    marked_parts: list[str] = []
+    for i, seg in enumerate(parts):
+        marked_parts.append(HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+        if i < len(sentinels):
+            marked_parts.append(sentinels[i])
+    out = "".join(marked_parts)
     return {"translation": out, "unknown_terms": [], "notes": ["mock"]}
 
 
@@ -348,8 +439,14 @@ def main(argv=None):
     cfg = load_config(vault_root)
     tcfg = cfg.get("translation", {})
 
-    # Glossary gate
-    glossary_path = Path(args.glossary) if args.glossary else vault_root / "data" / "domain_terms" / "glossary.csv"
+    # Glossary gate — path from CLI > convert_config.json translation.glossary_path > default
+    if args.glossary:
+        glossary_path = Path(args.glossary)
+    elif tcfg.get("glossary_path"):
+        gp = Path(tcfg["glossary_path"])
+        glossary_path = gp if gp.is_absolute() else vault_root / gp
+    else:
+        glossary_path = vault_root / "data" / "domain_terms" / "glossary.csv"
     # Fallback: glossary_proposed.csv if glossary.csv not yet created (pre-approval phase)
     if not glossary_path.exists() and glossary_path.name == "glossary.csv":
         alt = glossary_path.parent / "glossary_proposed.csv"
@@ -398,8 +495,8 @@ def main(argv=None):
     out_root = Path(args.out_dir) if args.out_dir else vault_root / "data" / "translations"
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Ledger
-    ledger_path = out_root / "ledger.jsonl"
+    # Ledger (canonical: vault_root/data/translations/ledger.jsonl)
+    ledger_path = get_ledger_path(vault_root, out_root)
     glossary_version = ""
     if glossary_path.exists():
         try:
@@ -425,7 +522,11 @@ def main(argv=None):
         if out_file.exists() and not args.force:
             continue
 
-        chunks = chunk_markdown(raw_text)
+        try:
+            chunk_chars = int(tcfg.get("chunk_chars", 6000))
+        except (TypeError, ValueError):
+            chunk_chars = 6000
+        chunks = chunk_markdown(raw_text, max_chars=chunk_chars)
         chunk_translations: list[str] = []
         doc_unknown: list[str] = []
         prev_tail = ""
@@ -487,6 +588,7 @@ def main(argv=None):
         # Ledger event
         event = {
             "event": "translation_completed" if status == "completed" else "blocked_on_term",
+            "ts": datetime.now(timezone.utc).isoformat(),
             "source_doc": rel,
             "source_hash": src_hash,
             "model": model,

@@ -72,7 +72,17 @@ def load_glossary_terms(glossary_path: Path) -> dict[str, str]:
 
 
 def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: dict[str, str]) -> list[dict]:
-    """Same Hebrew term rendered differently across docs -> flag."""
+    """Flag leftover ⟦he:...⟧ markers for approved terms (not divergent-English detection).
+
+    Currently only detects approved glossary terms still present as unresolved
+    markers in multiple docs. Detecting divergent English renderings of the
+    same Hebrew term across docs is TODO — requires storing the chosen English
+    per occurrence and comparing variants.
+
+    Config: translation.base_url is the canonical key; reviewer inherits it
+    unless translation.reviewer_base_url (or TRANSLATE_REVIEWER_BASE_URL env)
+    is explicitly set (see main()).
+    """
     flags: list[dict] = []
     # For each glossary term, collect how it was rendered across translations
     # Heuristic: check if glossary English appears where Hebrew would have been
