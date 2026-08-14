@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 # Single source for all token families. TABLE/TABLE_CELL are additions for
 # table cell-by-cell handling (md-translator has no table-cell tokens).
@@ -21,8 +22,13 @@ NOT_PLACEHOLDER = rf"(?!<<<(?:{PLACEHOLDER_PATTERN})>>>)"
 _COUNTER_SEED_RE = re.compile(r"<<<[A-Z_]+_(\d{1,9})>>>")
 
 # ── Table helpers (also used by translation_qa) ──────────────────────────
+# NOTE: Keep in sync with scripts/translation_qa.py (_TABLE_SEP_QA_RE, _split_row_cells).
+# _TABLE_SEP_RE matches GFM separator rows with optional outer pipes.
 _TABLE_SEP_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
-_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+# Row detection: any line containing "|" is a potential row; tables are
+# confirmed only when the next line is a separator (header+separator pair),
+# so prose like "a | b" without a separator is not treated as a table.
+_TABLE_ROW_RE = re.compile(r"^\s*.*\|.*$")
 
 
 def _is_table_separator(line: str) -> bool:
@@ -93,9 +99,6 @@ def compute_counter_seed(lines: list[str]) -> int:
     return seed
 
 
-from dataclasses import dataclass
-
-
 @dataclass
 class MdOptions:
     translate_frontmatter: bool = False
@@ -133,7 +136,7 @@ def filter_markdown_lines(lines: list[str], opts: MdOptions) -> FilterResult:
 
     # 1. Frontmatter — only if translate_frontmatter is False
     if not opts.translate_frontmatter:
-        m = re.match(r"^---\n([\s\S]*?)\n---\n?", full_text)
+        m = re.match(r"^---\r?\n([\s\S]*?)\r?\n---\r?\n?", full_text)
         if m:
             body = m.group(1)
             first_nonempty = next((ln.strip() for ln in body.split("\n") if ln.strip()), "")
@@ -306,7 +309,7 @@ def filter_markdown_lines(lines: list[str], opts: MdOptions) -> FilterResult:
         )
         HTML_CLOSE_RE = re.compile(r"</([a-zA-Z][a-zA-Z0-9-]*)>")
         HTML_OPEN_RE = re.compile(
-            rf"<([a-zA-Z][a-zA-Z0-9-]*)(?:\s+[a-zA-Z_:@#](?:{NOT_PLACEHOLDER}[^>\"']|\"[^\"]*\"|'[^']*')*|\s*\/|\s+)?>"
+            rf"<([a-zA-Z][a-zA-Z0-9-]*)(?:\s+[a-zA-Z_:@#{{](?:{NOT_PLACEHOLDER}[^>\"']|\"[^\"]*\"|'[^']*')*|\s*\/|\s+)?>"
         )
 
         def _html_self(m: re.Match) -> str:
@@ -448,6 +451,9 @@ def filter_markdown_lines(lines: list[str], opts: MdOptions) -> FilterResult:
     content_lines = table_block_lines
     content_indices = list(range(len(content_lines)))
     # source_line_numbers: collapsed placeholders contribute their newline count
+    # Only whole-document collapses (frontmatter/code/html/latex_block) can span
+    # multiple lines. Table/table_cell placeholders are always single-line
+    # (one row/cell), so they are intentionally excluded.
     newline_counts: dict[str, int] = {}
     for d in [frontmatter_placeholders, code_placeholders, html_placeholders, latex_block_placeholders]:
         for k, v in d.items():

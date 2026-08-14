@@ -147,7 +147,23 @@ def load_glossary(glossary_path: Path) -> list[dict]:
     return list(reader)
 
 
-def load_person_names(vault_root: Path) -> tuple[set[str], set[str]]:
+def load_codenames(vault_root: Path) -> set[str]:
+    """Load org codenames that must NOT be masked as person names.
+
+    Codenames are Hebrew terms like ברק/דניאל that collide with common given names
+    but have English equivalents in the glossary and must be translated.
+    File: data/person_names/codenames.txt — one term per line, # comments ignored.
+    """
+    p = vault_root / "data" / "person_names" / "codenames.txt"
+    if not p.exists():
+        return set()
+    try:
+        return {line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    except OSError:
+        return set()
+
+
+def load_person_names(vault_root: Path, exclude: set[str] | None = None) -> tuple[set[str], set[str]]:
     first_p = vault_root / "data" / "person_names" / "first_names.txt"
     last_p = vault_root / "data" / "person_names" / "last_names_ranked.txt"
     if not last_p.exists():
@@ -163,6 +179,14 @@ def load_person_names(vault_root: Path) -> tuple[set[str], set[str]]:
                         s.add(t)
             except OSError:
                 pass
+    # Codename exclusion: org codenames that are common Hebrew names must be translated,
+    # not masked as PERSON. Static file + dynamic glossary terms are both excluded.
+    codenames = load_codenames(vault_root)
+    if exclude:
+        codenames = codenames | exclude
+    if codenames:
+        first -= codenames
+        last -= codenames
     return first, last
 
 
@@ -789,7 +813,16 @@ def main(argv=None):
     else:
         print(f"Glossary: none ({glossary_path} not found) — translating without glossary")
 
-    first_names, last_names = load_person_names(vault_root)
+    # Codename-aware person names: exclude org codenames (static file + glossary terms)
+    # so that a codename like ברק/דניאל is translated via glossary, not masked as PERSON.
+    glossary_terms = {r.get("term_he", "").strip() for r in glossary if (r.get("status") or "").strip() in ("approved", "keep_source") and r.get("term_he", "").strip()}
+    codenames = load_codenames(vault_root)
+    first_names, last_names = load_person_names(vault_root, exclude=glossary_terms)
+    excluded_from_person = codenames | glossary_terms
+    if excluded_from_person:
+        # Report how many codenames were removed from the allowlist (for audit)
+        # Count before vs after is not kept, so just report the set size
+        print(f"Codenames excluded from PERSON guard: {len(excluded_from_person)} ({', '.join(sorted(list(excluded_from_person))[:5])}{' ...' if len(excluded_from_person) > 5 else ''})")
     print(f"Person names: {len(first_names)} first, {len(last_names)} last")
 
     corpus_dir = resolve_corpus_dir(vault_root, Path(args.input_dir) if args.input_dir else None)
@@ -868,7 +901,7 @@ def main(argv=None):
             g_rows = glossary_for_chunk(chunk_text, glossary)
 
             # ── Masked translation path (md_mask) ──
-            use_mask = not args.no_mask and not args.mock
+            use_mask = not args.no_mask
             if use_mask:
                 opts = md_mask.MdOptions(
                     translate_frontmatter=False,
@@ -879,7 +912,7 @@ def main(argv=None):
                 filt = md_mask.filter_markdown_lines(chunk_text.split("\n"), opts)
                 segs = md_mask.split_markdown_segments(filt.content_lines, filt.source_line_numbers)
                 cell_texts = md_mask.get_table_cell_texts(filt.maps)
-                SEG_DELIM = "\n---SEG---\n"
+                SEG_DELIM = "⟦SEG⟧"
                 if segs.texts_to_translate:
                     seg_prompt = build_prompt(
                         SEG_DELIM.join(segs.texts_to_translate),
@@ -888,8 +921,12 @@ def main(argv=None):
                         prev_tail,
                         invariants,
                     )
-                    res_seg = call_llm(base_url, api_key, model, seg_prompt)
-                    translated_seg_text = res_seg["translation"]
+                    if args.mock:
+                        res_seg = mock_translate(SEG_DELIM.join(segs.texts_to_translate), g_rows, invariants)
+                        translated_seg_text = res_seg["translation"]
+                    else:
+                        res_seg = call_llm(base_url, api_key, model, seg_prompt)
+                        translated_seg_text = res_seg["translation"]
                     translated_segments = translated_seg_text.split(SEG_DELIM)
                     if len(translated_segments) != len(segs.texts_to_translate):
                         raise RuntimeError(
@@ -900,11 +937,27 @@ def main(argv=None):
                     translated_segments = []
                     res_seg = {"unknown_terms": [], "notes": []}
                 if cell_texts:
-                    translated_cells: list[str] = []
-                    for cell in cell_texts:
-                        cell_prompt = build_prompt(cell, section_path, g_rows, "", None)
+                    if args.mock:
+                        # Batch cells in mock as well — single mock call with delimiter
+                        cell_delim = "⟦CELL⟧"
+                        joined_cells = cell_delim.join(cell_texts)
+                        cr = mock_translate(joined_cells, g_rows, None)
+                        translated_cells = cr["translation"].split(cell_delim)
+                        if len(translated_cells) != len(cell_texts):
+                            raise RuntimeError(
+                                f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)}"
+                            )
+                    else:
+                        # Batch all cells in one LLM call (was per-cell loop — 200 calls for 50x4 table)
+                        cell_delim = "⟦CELL⟧"
+                        joined_cells = cell_delim.join(cell_texts)
+                        cell_prompt = build_prompt(joined_cells, section_path, g_rows, "", None)
                         cr = call_llm(base_url, api_key, model, cell_prompt)
-                        translated_cells.append(cr["translation"])
+                        translated_cells = cr["translation"].split(cell_delim)
+                        if len(translated_cells) != len(cell_texts):
+                            raise RuntimeError(
+                                f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)} — model did not preserve delimiters"
+                            )
                     md_mask.inject_translated_table_cells(filt.maps, translated_cells)
                 merged_lines = md_mask.merge_markdown_segments(segs.line_segments, translated_segments)
                 trans = md_mask.restore_placeholders("\n".join(merged_lines), filt.maps)

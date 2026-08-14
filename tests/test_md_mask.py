@@ -454,6 +454,36 @@ class TestGoldenFiles(unittest.TestCase):
     def test_golden_hebrew_table(self):
         self._roundtrip(Path("tests/fixtures/md_mask/golden_hebrew_table.md"))
 
+    def test_golden_prose_pipe(self):
+        self._roundtrip(Path("tests/fixtures/md_mask/golden_prose_pipe.md"))
+
+    def test_outerless_table(self):
+        import md_mask
+
+        # GFM table without outer pipes must still be detected
+        lines = ["Hebrew | English", "---|---", "שלום | hello"]
+        res = md_mask.filter_markdown_lines(lines, md_mask.MdOptions())
+        self.assertIn("<<<TABLE_CELL_", "\n".join(res.content_lines))
+        restored = md_mask.restore_placeholders("\n".join(res.content_lines), res.maps)
+        # Outer-pipe canonicalization is intentional (see review issue #2, skipped)
+        # — content must survive, pipes may be normalized to outer-pipe form
+        self.assertIn("Hebrew", restored)
+        self.assertIn("English", restored)
+        self.assertIn("שלום", restored)
+        self.assertIn("hello", restored)
+        # QA must see it as a table
+        import translation_qa as qa
+
+        self.assertEqual(qa.check_table_fidelity("\n".join(lines), restored)["status"], "pass")
+
+    def test_prose_pipe_no_table(self):
+        import md_mask
+
+        lines = ["This is prose with a | pipe but no separator after."]
+        res = md_mask.filter_markdown_lines(lines, md_mask.MdOptions())
+        self.assertNotIn("TABLE_CELL_", "\n".join(res.content_lines))
+        self.assertNotIn("TABLE_", "\n".join(res.content_lines))
+
 
 class TestRemoveCharsOrdering(unittest.TestCase):
     def test_remove_chars_before_restore(self):

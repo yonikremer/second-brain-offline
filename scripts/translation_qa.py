@@ -38,10 +38,11 @@ HE_MARKER_RE = re.compile(r"⟦he:[^⟧]+⟧")
 HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 FENCE_RE = re.compile(r"```")
 LIST_RE = re.compile(r"^\s*[-*]\s+", re.MULTILINE)
-TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
+TABLE_ROW_RE = re.compile(r"^\s*.*\|.*$", re.MULTILINE)
 NUM_RE = re.compile(r"\b\d[\d.,]*\b")
 
 # Table fidelity: strict GFM table invariants (highest-risk construct)
+# Keep in sync with scripts/md_mask.py (_TABLE_SEP_RE, _split_table_cells).
 _TABLE_SEP_QA_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
 
 
@@ -75,11 +76,11 @@ def _parse_tables(text: str) -> list[list[list[str]]]:
     tables: list[list[list[str]]] = []
     i = 0
     while i < len(lines):
-        if i + 1 < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[i]) and _TABLE_SEP_QA_RE.match(lines[i + 1]):
+        if i + 1 < len(lines) and re.match(r"^\s*.*\|.*$", lines[i]) and _TABLE_SEP_QA_RE.match(lines[i + 1]):
             rows: list[list[str]] = []
             rows.append([c.strip() for c in _split_row_cells(lines[i])])
             i += 2
-            while i < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[i]) and not _TABLE_SEP_QA_RE.match(lines[i]):
+            while i < len(lines) and re.match(r"^\s*.*\|.*$", lines[i]) and not _TABLE_SEP_QA_RE.match(lines[i]):
                 rows.append([c.strip() for c in _split_row_cells(lines[i])])
                 i += 1
             tables.append(rows)
@@ -131,19 +132,25 @@ def _read_csv_skip_comments(path: Path) -> list[str]:
 
 
 def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
-    """Load person names allowlist for residual_hebrew suppression."""
+    """Load person names allowlist for residual_hebrew suppression.
+
+    Codename-aware: org codenames (data/person_names/codenames.txt) that
+    collide with Hebrew names are removed so they are not suppressed.
+    """
     names: set[str] = set()
     candidates: list[Path] = []
+    codename_candidates: list[Path] = []
     if vault_root is not None:
         candidates.append(vault_root / "data" / "person_names" / "first_names.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names_ranked.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names.txt")
+        codename_candidates.append(vault_root / "data" / "person_names" / "codenames.txt")
     else:
-        # Fallback: walk parents from cwd looking for data/person_names
         cur = Path.cwd().resolve()
         for p in [cur] + list(cur.parents):
             candidates.append(p / "data" / "person_names" / "first_names.txt")
             candidates.append(p / "data" / "person_names" / "last_names_ranked.txt")
+            codename_candidates.append(p / "data" / "person_names" / "codenames.txt")
     for p in candidates:
         if p.exists():
             try:
@@ -153,6 +160,19 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
                         names.add(t)
             except OSError:
                 pass
+    # Remove codenames from the allowlist (they must be translated, not suppressed)
+    codenames: set[str] = set()
+    for p in codename_candidates:
+        if p.exists():
+            try:
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    t = line.strip()
+                    if t and not t.lstrip().startswith("#"):
+                        codenames.add(t)
+            except OSError:
+                pass
+    if codenames:
+        names -= codenames
     return names
 
 
