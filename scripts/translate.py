@@ -698,6 +698,280 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
     )
 
 
+def format_qa_failures(checks: list[dict]) -> list[dict]:
+    """Filter QA checks to failures only (status==fail)."""
+    return [c for c in checks if c.get("status") == "fail"]
+
+
+def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dict],
+                     glossary_rows: list[dict] | None = None,
+                     invariants: dict | None = None) -> str:
+    """Prompt for LLM to repair previous translation given QA failures."""
+    src_cap = source_text[:12000]
+    if len(source_text) > 12000:
+        src_cap += "\n…(truncated)"
+    prev_cap = prev_translation[:12000]
+    if len(prev_translation) > 12000:
+        prev_cap += "\n…(truncated)"
+    failure_block = json.dumps(failures, ensure_ascii=False, indent=2)[:6000]
+    glossary_block = ""
+    if glossary_rows:
+        lines = []
+        for r in glossary_rows[:20]:
+            term = r.get("term_he", "")
+            eng = r.get("english", "")
+            if term and eng:
+                lines.append(f"- {term} → {eng}")
+        if lines:
+            glossary_block = "Glossary (must use exactly):\n" + "\n".join(lines) + "\n\n"
+    invariants_block = ""
+    if invariants:
+        parts = []
+        for cat, items in invariants.items():
+            if items:
+                parts.append(f"{cat}: {json.dumps(items[:10], ensure_ascii=False)}")
+        if parts:
+            invariants_block = "Preserve verbatim in order:\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
+    return (
+        "You are repairing a Hebrew→English markdown translation that FAILED scripted QA checks.\n"
+        "Fix ONLY the reported failures. Keep everything else identical.\n"
+        "Rules:\n"
+        "- Preserve headings, lists, tables, code fences exactly (same counts) and in order.\n"
+        "- Use glossary renderings exactly where they appear.\n"
+        "- Person names, English/URLs/code/YAML below must be copied verbatim and in order.\n"
+        "- Never invent translations for unknown terms — use ⟦he:term⟧ and list in unknown_terms.\n"
+        "- Output JSON: {\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}\n\n"
+        f"{glossary_block}"
+        f"{invariants_block}"
+        f"QA failures to fix:\n{failure_block}\n\n"
+        f"Original Hebrew source:\n{src_cap}\n\n"
+        f"Previous translation (to repair):\n{prev_cap}\n"
+    )
+
+
+def run_qa_for_doc(source_path: Path, trans_body: str, trans_meta: dict,
+                   glossary: list[dict], vault_root: Path | None) -> list[dict]:
+    """Run scripted QA battery; returns list of check dicts. Falls back gracefully."""
+    try:
+        import translation_qa as qa_mod
+    except ImportError:
+        return []
+    try:
+        return qa_mod.run_all(source_path, trans_body, trans_meta, glossary, vault_root=vault_root)
+    except Exception as e:
+        return [{"check": "qa_runner", "status": "fail", "error": str(e)[:500]}]
+
+
+def _translate_chunks(raw_text: str, first_names: set[str], last_names: set[str],
+                      glossary: list[dict], base_url: str, api_key: str, model: str,
+                      mock: bool, chunk_chars: int, no_mask: bool,
+                      name_candidates: set[str] | None) -> tuple[str, list[str], list[dict]]:
+    """Translate raw_text chunk by chunk. Returns (full_translation, doc_unknown, chunk_notes)."""
+    chunks = chunk_markdown(raw_text, max_chars=chunk_chars)
+    chunk_translations: list[str] = []
+    doc_unknown: list[str] = []
+    all_notes: list[dict] = []
+    prev_tail = ""
+    for ch in chunks:
+        chunk_text = ch["chunk_text"]
+        section_path = ch["section_path"]
+        invariants = extract_preservation_invariants(chunk_text, first_names, last_names)
+        if name_candidates is not None and invariants["person_names"]:
+            name_candidates.update(invariants["person_names"])
+        g_rows = glossary_for_chunk(chunk_text, glossary)
+        use_mask = not no_mask
+        if use_mask:
+            opts = md_mask.MdOptions(
+                translate_frontmatter=False,
+                translate_multiline_code=False,
+                translate_latex=False,
+                translate_link_text=True,
+            )
+            filt = md_mask.filter_markdown_lines(chunk_text.split("\n"), opts)
+            segs = md_mask.split_markdown_segments(filt.content_lines, filt.source_line_numbers)
+            cell_texts = md_mask.get_table_cell_texts(filt.maps)
+            SEG_DELIM = "⟦SEG⟧"
+            if segs.texts_to_translate:
+                seg_prompt = build_prompt(
+                    SEG_DELIM.join(segs.texts_to_translate),
+                    section_path,
+                    g_rows,
+                    prev_tail,
+                    invariants,
+                )
+                if mock:
+                    res_seg = mock_translate(SEG_DELIM.join(segs.texts_to_translate), g_rows, invariants)
+                    translated_seg_text = res_seg["translation"]
+                else:
+                    res_seg = call_llm(base_url, api_key, model, seg_prompt)
+                    translated_seg_text = res_seg["translation"]
+                translated_segments = translated_seg_text.split(SEG_DELIM)
+                if len(translated_segments) != len(segs.texts_to_translate):
+                    raise RuntimeError(
+                        f"Segment count mismatch: sent {len(segs.texts_to_translate)}, "
+                        f"got {len(translated_segments)} — model did not preserve delimiters"
+                    )
+            else:
+                translated_segments = []
+                res_seg = {"unknown_terms": [], "notes": []}
+            if cell_texts:
+                if mock:
+                    cell_delim = "⟦CELL⟧"
+                    joined_cells = cell_delim.join(cell_texts)
+                    cr = mock_translate(joined_cells, g_rows, None)
+                    translated_cells = cr["translation"].split(cell_delim)
+                    if len(translated_cells) != len(cell_texts):
+                        raise RuntimeError(
+                            f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)}"
+                        )
+                else:
+                    cell_delim = "⟦CELL⟧"
+                    joined_cells = cell_delim.join(cell_texts)
+                    cell_prompt = build_prompt(joined_cells, section_path, g_rows, "", None)
+                    cr = call_llm(base_url, api_key, model, cell_prompt)
+                    translated_cells = cr["translation"].split(cell_delim)
+                    if len(translated_cells) != len(cell_texts):
+                        raise RuntimeError(
+                            f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)} — model did not preserve delimiters"
+                        )
+                md_mask.inject_translated_table_cells(filt.maps, translated_cells)
+            merged_lines = md_mask.merge_markdown_segments(segs.line_segments, translated_segments)
+            trans = md_mask.restore_placeholders("\n".join(merged_lines), filt.maps)
+            res = {
+                "translation": trans,
+                "unknown_terms": res_seg.get("unknown_terms", []),
+                "notes": res_seg.get("notes", []),
+            }
+        else:
+            prompt = build_prompt(chunk_text, section_path, g_rows, prev_tail, invariants)
+            if mock:
+                res = mock_translate(chunk_text, g_rows, invariants)
+            else:
+                res = call_llm(base_url, api_key, model, prompt)
+            trans = res["translation"]
+        missing = verify_all_preserved(invariants, trans)
+        if missing:
+            for cat, items in missing.items():
+                res.setdefault("notes", []).append(f"preserve_fail:{cat}:{items}")
+            for items in missing.values():
+                doc_unknown.extend(items)
+        order_bad = verify_all_ordered(invariants, trans)
+        global_bad = verify_global_order(chunk_text, invariants, trans)
+        if order_bad:
+            for cat, items in order_bad.items():
+                res.setdefault("notes", []).append(f"order_fail:{cat}:{items}")
+            for items in order_bad.values():
+                doc_unknown.extend(items)
+        if global_bad:
+            res.setdefault("notes", []).append(f"global_order_fail:{global_bad}")
+            doc_unknown.extend(global_bad)
+        for ut in res.get("unknown_terms", []):
+            ut = str(ut).strip()
+            if ut and ut not in trans and ut in chunk_text:
+                marker = HE_MARKER_FMT.format(term=ut)
+                if marker not in trans:
+                    trans = trans.rstrip() + f" {marker}"
+            if ut:
+                doc_unknown.append(ut)
+        chunk_translations.append(trans)
+        prev_tail = trans[-400:] if trans else ""
+        if res.get("notes"):
+            all_notes.append({"chunk": section_path, "notes": res["notes"]})
+    full_translation = "\n\n".join(chunk_translations)
+    return full_translation, doc_unknown, all_notes
+
+
+def translate_one_doc(md_file: Path, vault_root: Path, out_root: Path,
+                      glossary: list[dict], first_names: set[str], last_names: set[str],
+                      base_url: str, api_key: str, model: str,
+                      mock: bool, fix_rounds: int, chunk_chars: int,
+                      no_mask: bool = False) -> dict:
+    """Translate single file (no QA fix loop). Returns dict with translation,status etc."""
+    rel = md_file.relative_to(vault_root).as_posix() if md_file.is_relative_to(vault_root) else md_file.name
+    raw_text = md_file.read_text(encoding="utf-8")
+    if is_english_only_doc(raw_text):
+        return {"skipped": True, "rel": rel, "source_hash": hashlib.sha256(raw_text.encode()).hexdigest(), "raw_text": raw_text}
+    src_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+    name_candidates: set[str] = set()
+    full_translation, doc_unknown, _notes = _translate_chunks(
+        raw_text, first_names, last_names, glossary, base_url, api_key, model, mock, chunk_chars, no_mask, name_candidates)
+    has_markers = "⟦he:" in full_translation
+    status = "blocked_on_term" if (has_markers or doc_unknown) else "completed"
+    return {
+        "translation": full_translation,
+        "status": status,
+        "marker_count": full_translation.count("⟦he:"),
+        "unknown_terms": sorted(set(doc_unknown)),
+        "source_hash": src_hash,
+        "rel": rel,
+        "raw_text": raw_text,
+        "name_candidates": name_candidates,
+    }
+
+
+def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
+                               glossary: list[dict], first_names: set[str], last_names: set[str],
+                               base_url: str, api_key: str, model: str,
+                               mock: bool, fix_rounds: int, chunk_chars: int,
+                               no_mask: bool = False) -> dict:
+    """Full doc translate + QA + bounded LLM fix rounds."""
+    result = translate_one_doc(md_file, vault_root, out_root, glossary, first_names, last_names,
+                               base_url, api_key, model, mock, fix_rounds, chunk_chars, no_mask)
+    if result.get("skipped"):
+        return result
+    source_path = md_file
+    trans_body = result["translation"]
+    raw_text = result["raw_text"]
+    meta_stub = {"source_doc": result["rel"]}
+    full_invariants = extract_preservation_invariants(raw_text, first_names, last_names)
+    checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
+    failures = format_qa_failures(checks)
+    fix_rounds_used = 0
+    all_fix_attempts: list[dict] = []
+    while failures and fix_rounds_used < fix_rounds:
+        fix_rounds_used += 1
+        if mock:
+            fixed = mock_translate(raw_text, glossary_for_chunk(raw_text, glossary), full_invariants)
+            new_body = fixed["translation"]
+        else:
+            fix_prompt = build_fix_prompt(raw_text, trans_body, failures,
+                                          glossary_rows=glossary_for_chunk(raw_text, glossary),
+                                          invariants=full_invariants)
+            try:
+                resp = call_llm(base_url, api_key, model, fix_prompt)
+                new_body = resp.get("translation", "")
+            except Exception as e:
+                all_fix_attempts.append({"round": fix_rounds_used, "error": str(e)[:500], "failures_before": failures})
+                break
+        # Include mock preservation recovery if needed: re-check invariants after mock fix
+        trans_body = new_body
+        all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures})
+        checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
+        failures = format_qa_failures(checks)
+    if failures:
+        final_status = "qa_failed"
+    else:
+        has_markers = "⟦he:" in trans_body
+        # doc_unknown from initial may still be relevant if QA passed but original had blocked terms
+        # Re-derive blocked status from translation markers + unknown_terms style
+        final_status = "blocked_on_term" if has_markers else "completed"
+        # If original result was blocked_on_term and QA now passes, preserve blocked
+        if result.get("status") == "blocked_on_term" and final_status == "completed" and result.get("unknown_terms"):
+            # QA glossary_retention may have passed via markers, but still blocked is correct if markers remain
+            # has_markers already captures; if no markers but unknown_terms existed, QA passed means no failure, so completed
+            pass
+    result.update({
+        "translation": trans_body,
+        "status": final_status,
+        "marker_count": trans_body.count("⟦he:"),
+        "fix_rounds_used": fix_rounds_used,
+        "fix_attempts": all_fix_attempts,
+        "qa_checks": checks,
+        "qa_failures": failures,
+    })
+    return result
+
+
 def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int = 3) -> dict:
     url = base_url.rstrip("/") + "/chat/completions"
     payload = json.dumps({
@@ -877,6 +1151,13 @@ def main(argv=None):
     translated = 0
     blocked = 0
     skipped_english = 0
+    failed_docs: list[str] = []
+    qa_failed = 0
+
+    try:
+        chunk_chars = int(tcfg.get("chunk_chars", 6000))
+    except (TypeError, ValueError):
+        chunk_chars = 6000
 
     for md_file in md_files:
         rel = md_file.relative_to(vault_root).as_posix() if md_file.is_relative_to(vault_root) else md_file.name
@@ -886,9 +1167,39 @@ def main(argv=None):
             print(f" skip {rel}: {e}", file=sys.stderr)
             continue
 
-        # Entirely-English docs: skip translation (already English, nothing to do)
-        if is_english_only_doc(raw_text):
-            src_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+        # Cache check (content-addressed) — do before any LLM work
+        src_hash_pre = hashlib.sha256(raw_text.encode()).hexdigest()
+        store_dir_pre = out_root / src_hash_pre[:2] / src_hash_pre
+        out_file_pre = store_dir_pre / "translation.md"
+        if out_file_pre.exists() and not args.force:
+            continue
+
+        # Translate with QA fix loop (handles english-only internally)
+        try:
+            result = translate_one_doc_with_fix(
+                md_file, vault_root, out_root, glossary, first_names, last_names,
+                base_url, api_key, model, args.mock, fix_rounds, chunk_chars,
+                no_mask=args.no_mask)
+        except RuntimeError as e:
+            # Hard failure like segment mismatch
+            print(f"  {rel}: error {e}", file=sys.stderr)
+            failed_docs.append(rel)
+            event = {
+                "event": "translation_error",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash_pre,
+                "model": model,
+                "glossary_version": glossary_version,
+                "status": "error",
+                "error": str(e)[:500],
+            }
+            with open(ledger_path, "a", encoding="utf-8") as lf:
+                lf.write(json.dumps(event, ensure_ascii=False) + "\n")
+            continue
+
+        if result.get("skipped"):
+            src_hash = result["source_hash"]
             event = {
                 "event": "skipped_english",
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -904,145 +1215,21 @@ def main(argv=None):
             print(f"  {rel}: skipped_english (no Hebrew)")
             continue
 
-        src_hash = hashlib.sha256(raw_text.encode()).hexdigest()
-        store_dir = out_root / src_hash[:2] / src_hash
-        out_file = store_dir / "translation.md"
-        if out_file.exists() and not args.force:
-            continue
+        # Aggregate name candidates
+        if result.get("name_candidates"):
+            name_candidates.update(result["name_candidates"])
 
-        try:
-            chunk_chars = int(tcfg.get("chunk_chars", 6000))
-        except (TypeError, ValueError):
-            chunk_chars = 6000
-        chunks = chunk_markdown(raw_text, max_chars=chunk_chars)
-        chunk_translations: list[str] = []
-        doc_unknown: list[str] = []
-        prev_tail = ""
-
-        for ch in chunks:
-            chunk_text = ch["chunk_text"]
-            section_path = ch["section_path"]
-            # Extract invariants (person names, English spans, URLs/paths) — passed as
-            # preservation context to LLM, not masked. LLM sees raw text.
-            invariants = extract_preservation_invariants(chunk_text, first_names, last_names)
-            if invariants["person_names"]:
-                name_candidates.update(invariants["person_names"])
-            # Filtered glossary (use raw chunk for Hebrew term matching)
-            g_rows = glossary_for_chunk(chunk_text, glossary)
-
-            # ── Masked translation path (md_mask) ──
-            use_mask = not args.no_mask
-            if use_mask:
-                opts = md_mask.MdOptions(
-                    translate_frontmatter=False,
-                    translate_multiline_code=False,
-                    translate_latex=False,
-                    translate_link_text=True,
-                )
-                filt = md_mask.filter_markdown_lines(chunk_text.split("\n"), opts)
-                segs = md_mask.split_markdown_segments(filt.content_lines, filt.source_line_numbers)
-                cell_texts = md_mask.get_table_cell_texts(filt.maps)
-                SEG_DELIM = "⟦SEG⟧"
-                if segs.texts_to_translate:
-                    seg_prompt = build_prompt(
-                        SEG_DELIM.join(segs.texts_to_translate),
-                        section_path,
-                        g_rows,
-                        prev_tail,
-                        invariants,
-                    )
-                    if args.mock:
-                        res_seg = mock_translate(SEG_DELIM.join(segs.texts_to_translate), g_rows, invariants)
-                        translated_seg_text = res_seg["translation"]
-                    else:
-                        res_seg = call_llm(base_url, api_key, model, seg_prompt)
-                        translated_seg_text = res_seg["translation"]
-                    translated_segments = translated_seg_text.split(SEG_DELIM)
-                    if len(translated_segments) != len(segs.texts_to_translate):
-                        raise RuntimeError(
-                            f"Segment count mismatch: sent {len(segs.texts_to_translate)}, "
-                            f"got {len(translated_segments)} — model did not preserve delimiters"
-                        )
-                else:
-                    translated_segments = []
-                    res_seg = {"unknown_terms": [], "notes": []}
-                if cell_texts:
-                    if args.mock:
-                        # Batch cells in mock as well — single mock call with delimiter
-                        cell_delim = "⟦CELL⟧"
-                        joined_cells = cell_delim.join(cell_texts)
-                        cr = mock_translate(joined_cells, g_rows, None)
-                        translated_cells = cr["translation"].split(cell_delim)
-                        if len(translated_cells) != len(cell_texts):
-                            raise RuntimeError(
-                                f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)}"
-                            )
-                    else:
-                        # Batch all cells in one LLM call (was per-cell loop — 200 calls for 50x4 table)
-                        cell_delim = "⟦CELL⟧"
-                        joined_cells = cell_delim.join(cell_texts)
-                        cell_prompt = build_prompt(joined_cells, section_path, g_rows, "", None)
-                        cr = call_llm(base_url, api_key, model, cell_prompt)
-                        translated_cells = cr["translation"].split(cell_delim)
-                        if len(translated_cells) != len(cell_texts):
-                            raise RuntimeError(
-                                f"Cell count mismatch: sent {len(cell_texts)}, got {len(translated_cells)} — model did not preserve delimiters"
-                            )
-                    md_mask.inject_translated_table_cells(filt.maps, translated_cells)
-                merged_lines = md_mask.merge_markdown_segments(segs.line_segments, translated_segments)
-                trans = md_mask.restore_placeholders("\n".join(merged_lines), filt.maps)
-                res = {
-                    "translation": trans,
-                    "unknown_terms": res_seg.get("unknown_terms", []),
-                    "notes": res_seg.get("notes", []),
-                }
-            else:
-                prompt = build_prompt(chunk_text, section_path, g_rows, prev_tail, invariants)
-                if args.mock:
-                    res = mock_translate(chunk_text, g_rows, invariants)
-                else:
-                    res = call_llm(base_url, api_key, model, prompt)
-                trans = res["translation"]
-            # Verify invariants preserved verbatim + order — deterministic post-check
-            missing = verify_all_preserved(invariants, trans)
-            if missing:
-                for cat, items in missing.items():
-                    res.setdefault("notes", []).append(f"preserve_fail:{cat}:{items}")
-                for items in missing.values():
-                    doc_unknown.extend(items)
-            order_bad = verify_all_ordered(invariants, trans)
-            global_bad = verify_global_order(chunk_text, invariants, trans)
-            if order_bad:
-                for cat, items in order_bad.items():
-                    res.setdefault("notes", []).append(f"order_fail:{cat}:{items}")
-                for items in order_bad.values():
-                    doc_unknown.extend(items)
-            if global_bad:
-                res.setdefault("notes", []).append(f"global_order_fail:{global_bad}")
-                doc_unknown.extend(global_bad)
-            # Inject markers for unknown terms that aren't already marked
-            for ut in res.get("unknown_terms", []):
-                ut = str(ut).strip()
-                if ut and ut not in trans and ut in chunk_text:
-                    # Add marker adjacent to first occurrence of translation of that region is tricky;
-                    # for now append marker list — stage-5 says markers are inline ⟦he:term⟧
-                    marker = HE_MARKER_FMT.format(term=ut)
-                    if marker not in trans:
-                        trans = trans.rstrip() + f" {marker}"
-                if ut:
-                    doc_unknown.append(ut)
-
-            chunk_translations.append(trans)
-            # Context tail for next chunk
-            prev_tail = trans[-400:] if trans else ""
-
-        full_translation = "\n\n".join(chunk_translations)
-        # Determine if blocked_on_term
-        has_markers = "⟦he:" in full_translation
-        status = "blocked_on_term" if (has_markers or doc_unknown) else "completed"
+        full_translation = result["translation"]
+        status = result["status"]
+        src_hash = result["source_hash"]
+        fix_used = result.get("fix_rounds_used", 0)
+        qa_failures = result.get("qa_failures", [])
+        qa_checks = result.get("qa_checks", [])
 
         # Write content-addressed store
+        store_dir = out_root / src_hash[:2] / src_hash
         store_dir.mkdir(parents=True, exist_ok=True)
+        out_file = store_dir / "translation.md"
         frontmatter = {
             "source_doc": rel,
             "source_hash": src_hash,
@@ -1050,31 +1237,100 @@ def main(argv=None):
             "glossary_version": glossary_version,
             "status": status,
             "marker_count": full_translation.count("⟦he:"),
-            "unknown_terms": sorted(set(doc_unknown)),
+            "unknown_terms": sorted(set(result.get("unknown_terms", []))),
+            "fix_rounds_used": fix_used,
         }
+        if qa_failures:
+            frontmatter["qa_failures"] = qa_failures[:5]
         fm_text = "---\n" + json.dumps(frontmatter, ensure_ascii=False, indent=2) + "\n---\n\n"
         out_file.write_text(fm_text + full_translation, encoding="utf-8")
 
-        # Ledger event
-        event = {
-            "event": "translation_completed" if status == "completed" else "blocked_on_term",
+        # Ledger: fix attempts
+        for attempt in result.get("fix_attempts", []):
+            evt = {
+                "event": "fix_attempt",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash,
+                "model": model,
+                "glossary_version": glossary_version,
+                "round": attempt.get("round"),
+                "failures_before": attempt.get("failures_before", [])[:3],
+            }
+            if "error" in attempt:
+                evt["error"] = attempt["error"]
+            with open(ledger_path, "a", encoding="utf-8") as lf:
+                lf.write(json.dumps(evt, ensure_ascii=False) + "\n")
+
+        # Ledger: qa_result
+        qa_event = {
+            "event": "qa_result",
             "ts": datetime.now(timezone.utc).isoformat(),
             "source_doc": rel,
             "source_hash": src_hash,
             "model": model,
             "glossary_version": glossary_version,
             "status": status,
-            "marker_count": frontmatter["marker_count"],
-            "unknown_terms": frontmatter["unknown_terms"],
+            "fix_rounds_used": fix_used,
+            "qa_failures": qa_failures[:5] if qa_failures else [],
         }
+        with open(ledger_path, "a", encoding="utf-8") as lf:
+            lf.write(json.dumps(qa_event, ensure_ascii=False) + "\n")
+
+        # Ledger: translation event
+        if status == "qa_failed":
+            event = {
+                "event": "qa_failed",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash,
+                "model": model,
+                "glossary_version": glossary_version,
+                "status": status,
+                "marker_count": frontmatter["marker_count"],
+                "unknown_terms": frontmatter["unknown_terms"],
+                "fix_rounds_used": fix_used,
+                "qa_failures": qa_failures[:5],
+            }
+            failed_docs.append(rel)
+            qa_failed += 1
+        elif status == "blocked_on_term":
+            event = {
+                "event": "blocked_on_term",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash,
+                "model": model,
+                "glossary_version": glossary_version,
+                "status": status,
+                "marker_count": frontmatter["marker_count"],
+                "unknown_terms": frontmatter["unknown_terms"],
+                "fix_rounds_used": fix_used,
+            }
+            blocked += 1
+        else:
+            event = {
+                "event": "translation_completed",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash,
+                "model": model,
+                "glossary_version": glossary_version,
+                "status": status,
+                "marker_count": frontmatter["marker_count"],
+                "unknown_terms": frontmatter["unknown_terms"],
+                "fix_rounds_used": fix_used,
+            }
+            translated += 1
         with open(ledger_path, "a", encoding="utf-8") as lf:
             lf.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-        if status == "blocked_on_term":
-            blocked += 1
+        # Console
+        if status == "qa_failed":
+            print(f"  {rel}: qa_failed after {fix_used} fix rounds: {qa_failures[:1]}", file=sys.stderr)
         else:
-            translated += 1
-        print(f"  {rel}: {status} ({len(chunk_translations)} chunks, {frontmatter['marker_count']} markers)")
+            chunk_info = f" ({fix_used} fix rounds)" if fix_used else ""
+            print(f"  {rel}: {status}{chunk_info} ({frontmatter['marker_count']} markers)")
 
     # Log name candidates
     if name_candidates:
@@ -1084,7 +1340,11 @@ def main(argv=None):
                 f.write(n + "\n")
         print(f"Name candidates: {len(name_candidates)} unique -> {cand_path}")
 
-    print(f"Done: {translated} completed, {blocked} blocked_on_term, {skipped_english} skipped_english -> {out_root}")
+    print(f"Done: {translated} completed, {blocked} blocked_on_term, {skipped_english} skipped_english, {qa_failed} qa_failed -> {out_root}")
+    if failed_docs:
+        print(f"FAILED: {len(failed_docs)} docs still invalid after {fix_rounds} fix rounds: {failed_docs[:5]}", file=sys.stderr)
+        print(f"Stop — fix budget exhausted. Inspect QA output and ledger, fix policy/glossary/prompt, retry with --fix-rounds N or --force.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

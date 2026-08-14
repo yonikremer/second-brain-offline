@@ -94,9 +94,13 @@ Error examples:
 
 ## Config & env (where translation block lives)
 
-- File: `convert_config.json` `translation: {base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path}`
-- Defaults: `base_url ""`, `reviewer_base_url ""` (inherits `base_url`), `api_key_env "TRANSLATE_API_KEY"`, `model "minimax-m2.7"`, `reviewer_model "kimi-k2.7"`, `chunk_chars 6000`, `review_sample 0.2`, `glossary_path "data/domain_terms/glossary.csv"`.
-- Env precedence: `TRANSLATE_BASE_URL` primary → `QMD_OPENAI_BASE_URL` fallback; `TRANSLATE_REVIEWER_BASE_URL` → `TRANSLATE_BASE_URL` → `translation.reviewer_base_url` → `translation.base_url`. Same for `API_KEY` (`TRANSLATE_API_KEY` → `QMD_OPENAI_API_KEY`). Reviewer model: `TRANSLATE_REVIEWER_MODEL` → `translation.reviewer_model`. `--mock` bypasses base_url requirement (api_key may be empty for no-auth gateways).
+- File: `convert_config.json` `translation: {base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path, fix_rounds}`
+- Defaults: `base_url ""`, `reviewer_base_url ""` (inherits `base_url`), `api_key_env "TRANSLATE_API_KEY"`, `model "minimax-m2.7"`, `reviewer_model "kimi-k2.7"`, `chunk_chars 6000`, `review_sample 0.2`, `glossary_path "data/domain_terms/glossary.csv"`, `fix_rounds 3`.
+- Env precedence: `TRANSLATE_BASE_URL` primary → `QMD_OPENAI_BASE_URL` fallback; `TRANSLATE_REVIEWER_BASE_URL` → `TRANSLATE_BASE_URL` → `translation.reviewer_base_url` → `translation.base_url`. Same for `API_KEY` (`TRANSLATE_API_KEY` → `QMD_OPENAI_API_KEY`). Reviewer model: `TRANSLATE_REVIEWER_MODEL` → `translation.reviewer_model`. Fix rounds: `--fix-rounds N` CLI → `TRANSLATE_FIX_ROUNDS` env → `translation.fix_rounds` config → default 3 (0=disable). `--mock` bypasses base_url requirement (api_key may be empty for no-auth gateways).
+
+## Auto-fix rounds
+
+`translate.py` runs scripted QA after each doc and, if failures remain, asks the LLM to repair them for up to `translation.fix_rounds` (default 3, CLI `--fix-rounds N`, env `TRANSLATE_FIX_ROUNDS`). Each attempt is logged as `fix_attempt` (+ `qa_result`) in `data/translations/ledger.jsonl` with `round`, `failures_before`, and `fix_rounds_used` in the frontmatter. If still invalid after N rounds, the doc is written as `qa_failed` (quarantine) and the script exits 1 fail-closed — inspect `qa.json` or the ledger, fix policy/glossary/prompt, and retry with `--force` or `--fix-rounds N`. This stops token waste on systematically broken docs.
 
 ## Expert time
 
