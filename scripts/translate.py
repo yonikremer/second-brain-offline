@@ -709,11 +709,14 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
     """Prompt for LLM to repair previous translation given QA failures."""
     src_cap = source_text[:12000]
     if len(source_text) > 12000:
-        src_cap += "\n…(truncated)"
+        src_cap += f"\n…(truncated {len(source_text) - 12000} chars omitted — chunked fix should have been used)"
     prev_cap = prev_translation[:12000]
     if len(prev_translation) > 12000:
-        prev_cap += "\n…(truncated)"
-    failure_block = json.dumps(failures, ensure_ascii=False, indent=2)[:6000]
+        prev_cap += f"\n…(truncated {len(prev_translation) - 12000} chars omitted — chunked fix should have been used)"
+    _full_failure = json.dumps(failures, ensure_ascii=False, indent=2)
+    failure_block = _full_failure[:6000]
+    if len(_full_failure) > 6000:
+        failure_block += "\n…(truncated)"
     glossary_block = ""
     if glossary_rows:
         lines = []
@@ -723,13 +726,20 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
             if term and eng:
                 lines.append(f"- {term} → {eng}")
         if lines:
-            glossary_block = "Glossary (must use exactly):\n" + "\n".join(lines) + "\n\n"
+            glossary_block = "Glossary (must use exactly):\n" + "\n".join(lines)
+            if glossary_rows and len(glossary_rows) > 20:
+                glossary_block += f"\n(+{len(glossary_rows) - 20} more)"
+            glossary_block += "\n\n"
     invariants_block = ""
     if invariants:
         parts = []
         for cat, items in invariants.items():
             if items:
-                parts.append(f"{cat}: {json.dumps(items[:10], ensure_ascii=False)}")
+                shown = items[:10]
+                part = f"{cat}: {json.dumps(shown, ensure_ascii=False)}"
+                if len(items) > 10:
+                    part += f" (+{len(items) - 10} more)"
+                parts.append(part)
         if parts:
             invariants_block = "Preserve verbatim in order:\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
     return (
@@ -747,6 +757,27 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
         f"Original Hebrew source:\n{src_cap}\n\n"
         f"Previous translation (to repair):\n{prev_cap}\n"
     )
+
+
+def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures: list[dict],
+                               glossary_rows: list[dict] | None, invariants: dict | None,
+                               chunk_chars: int) -> list[str]:
+    """Split large-doc fix into per-chunk prompts to avoid 12k truncation loss."""
+    src_chunks = chunk_markdown(source_text, max_chars=chunk_chars)
+    prev_chunks = chunk_markdown(prev_translation, max_chars=chunk_chars) if prev_translation.strip() else []
+    n = max(len(src_chunks), len(prev_chunks), 1)
+    prompts: list[str] = []
+    for i in range(n):
+        src = src_chunks[i]["chunk_text"] if i < len(src_chunks) else ""
+        prev = prev_chunks[i]["chunk_text"] if i < len(prev_chunks) else ""
+        section = src_chunks[i].get("section_path", "") if i < len(src_chunks) else f"chunk {i+1}/{n}"
+        chunk_glossary = glossary_for_chunk(src, glossary_rows) if glossary_rows and src else (glossary_rows or [])
+        # Use chunk-specific invariants to keep prompt focused
+        chunk_invariants = extract_preservation_invariants(src, set(), set()) if src else None
+        p = build_fix_prompt(src, prev, failures, chunk_glossary or glossary_rows, chunk_invariants or invariants)
+        p = f"Chunk {i+1}/{n} — Section: {section}\n\n" + p
+        prompts.append(p)
+    return prompts
 
 
 def run_qa_for_doc(source_path: Path, trans_body: str, trans_meta: dict,
@@ -936,6 +967,43 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
             new_body = fixed["translation"]
             fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
         else:
+            # For large docs, avoid silent 12k truncation by chunking the fix
+            is_large = len(raw_text) > 12000 or len(trans_body) > 12000
+            if is_large:
+                prompts = _build_chunked_fix_prompts(raw_text, trans_body, failures,
+                                                     glossary_for_chunk(raw_text, glossary),
+                                                     full_invariants, chunk_chars)
+                # Log truncation avoidance
+                print(f"  fix round {fix_rounds_used}: large doc ({len(raw_text)} src, {len(trans_body)} trans) — chunked into {len(prompts)} prompts", file=sys.stderr)
+                chunk_translations: list[str] = []
+                chunk_unknown: list[str] = []
+                chunk_failed = False
+                last_err = None
+                for p_idx, p in enumerate(prompts):
+                    try:
+                        resp = call_llm(base_url, api_key, model, p)
+                        ct = resp.get("translation", "")
+                        # If single-chunk response contains our chunk header, strip it
+                        chunk_translations.append(ct)
+                        chunk_unknown.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
+                        chunk_unknown.extend(re.findall(r"⟦he:[^⟧]+⟧", ct))
+                    except Exception as e:
+                        last_err = str(e)[:500]
+                        chunk_failed = True
+                        print(f"  fix chunk {p_idx+1}/{len(prompts)} failed: {last_err}", file=sys.stderr)
+                        break
+                if chunk_failed:
+                    all_fix_attempts.append({"round": fix_rounds_used, "error": last_err or "chunk fix failed", "failures_before": failures, "chunked": True, "chunks": len(prompts), "src_len": len(raw_text), "trans_len": len(trans_body)})
+                    break
+                new_body = "\n\n".join(chunk_translations)
+                fix_unknown_terms.extend(chunk_unknown)
+                # Record that this round was chunked
+                all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures, "chunked": True, "chunks": len(prompts), "src_len": len(raw_text), "trans_len": len(trans_body)})
+                trans_body = new_body
+                checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
+                failures = format_qa_failures(checks)
+                continue
+            # Normal whole-doc fix for small docs
             fix_prompt = build_fix_prompt(raw_text, trans_body, failures,
                                           glossary_rows=glossary_for_chunk(raw_text, glossary),
                                           invariants=full_invariants)

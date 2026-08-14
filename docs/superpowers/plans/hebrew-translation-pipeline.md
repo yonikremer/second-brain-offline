@@ -35,7 +35,7 @@ No change to semantics; just ensure landed tests pass: `tests/test_domain_terms_
 New script `scripts/glossary_translate.py` — **not** inline in extraction:
 
 - **Input:** `data/domain_terms/translation_seed.csv` + for each term, 2–3 **real context sentences** mined from `raw_md/` (or `raw/` fallback) — not invented. Utility `scripts/extract_domain_terms.py` already emits `example_doc`; extend to harvest 2–3 snippets per term via `grep` window over markdown-stripped text.
-- **Model:** MiniMax M2.7 (unlimited) proposes **all** terms (per user choice) — bulk proposal, expert corrects. Hebrew open models not used for generation. OpenAI-compatible APIs. New config keys in `convert_config.json` under `translation: { base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path }` — env precedence `TRANSLATE_BASE_URL` → `QMD_OPENAI_BASE_URL`; reviewer inherits `base_url` unless `reviewer_base_url` set. Fail-fast if base_url missing when not `--mock` (api_key may be empty for no-auth gateways).
+- **Model:** MiniMax M2.7 (unlimited) proposes **all** terms (per user choice) — bulk proposal, expert corrects. Hebrew open models not used for generation. OpenAI-compatible APIs. New config keys in `convert_config.json` under `translation: { base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path, fix_rounds }` — env precedence `TRANSLATE_BASE_URL` → `QMD_OPENAI_BASE_URL`; reviewer inherits `base_url` unless `reviewer_base_url` set. Fail-fast if base_url missing when not `--mock` (api_key may be empty for no-auth gateways).
 - **Prompt:** glossary-translate instruction: "Translate this Hebrew domain term to English. Context sentences: ... Keep person names in Hebrew. Output JSON {term_he, english, keep_source(bool), notes}." Enforce `keep_source` for terms that are internal names / part numbers / must-stay-Hebrew.
 - **Output:** `data/domain_terms/glossary_proposed.csv` with columns `term_he | english | keep_source | notes | status=proposed | example_doc | context_snippets | lang | model`. This is the machine draft — every row has a MiniMax proposal; anchoring risk acknowledged but accepted for expert-time savings (expert overwrites freely).
 - **CLI:** `python scripts/glossary_translate.py [vault_root] [--input PATH] [--out PATH] [--model ID] [--limit N] [--mock]` — first positional is `vault_root` (defaults `.`); contexts auto-resolve `raw_md/` else `raw/`.
@@ -54,7 +54,7 @@ CSV schema: `term_he,english,keep_source,notes,status,example_doc` — status en
 
 ### 3a) Script `scripts/translate.py`
 
-- **Config:** `convert_config.json` `translation: { base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path }` via deep-merge + `TRANSLATE_*` → `QMD_OPENAI_*` env fallback. `chunk_chars` defaults `6000`, injected into `chunk_markdown`; `glossary_path` defaults `data/domain_terms/glossary.csv`. No `enabled`/`blocked_on_term_dir` keys.
+- **Config:** `convert_config.json` `translation: { base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path, fix_rounds }` via deep-merge + `TRANSLATE_*` → `QMD_OPENAI_*` env fallback. `chunk_chars` defaults `6000`, injected into `chunk_markdown`; `glossary_path` defaults `data/domain_terms/glossary.csv`. No `enabled`/`blocked_on_term_dir` keys.
 - **Structural chunking:** at heading boundaries; if section > chunk_chars, at paragraph boundaries. Never mid-sentence/mid-table/mid-code-block/mid-frontmatter. Fixed 4000-char windows explicitly rejected per stage-5 spec; chunking is qmd-heading-aware aligned.
 - **Context header per chunk:** parent doc title, section path, glossary entries whose terms occur in this chunk — word-boundary (`(?<![א-ת])term(?![א-ת])` for Hebrew, token set for mixed), not substring — keeps prompts small. Previous chunk tail as context-only marker, not to be re-emitted.
 - **Person-name guard (people only) — allowlist-based (per user choice):**
@@ -64,11 +64,11 @@ CSV schema: `term_he,english,keep_source,notes,status,example_doc` — status en
   - Mechanics: token-boundary scan → mask spans to sentinels `⟦PERSON_0⟧` before LLM call; model instruction says "Do not translate ⟦PERSON_n⟧". Unmask after. Log any masked name not in allowlists → name-candidate queue (feeds back to `data/person_names/` via review packet).
   - Scope: people only — orgs/places translate normally (user confirmed). Codenames are treated as glossary terms, not people.
   - Failure mode: rare names absent from 592/818 → caught by optional NER or surfaced as `unknown_terms` for human queue; corpus-specific uncommon names get added to allowlist on first review (one-time cost). Codenames accidentally masked → glossary_retention would fail (English expected but Hebrew PERSON marker preserved) and QA would quarantine; with the glossary-driven exclusion the term translates via glossary as intended.
-- **CLI:** `python scripts/translate.py [vault_root] [--input DIR] [--glossary PATH] [--out DIR] [--check] [--mock] [--force] [--resume] [--limit N]` — positional is `vault_root`; `--check` gates on `check_glossary.py`; `--mock` applies glossary then wraps remaining Hebrew as `⟦he:…⟧` (sentinel-safe); `--resume` is alias for default skip-cache.
+- **CLI:** `python scripts/translate.py [vault_root] [--input DIR] [--glossary PATH] [--out DIR] [--check] [--mock] [--force] [--resume] [--limit N] [--fix-rounds N]` — positional is `vault_root`; `--check` gates on `check_glossary.py`; `--mock` applies glossary then wraps remaining Hebrew as `⟦he:…⟧` (sentinel-safe); `--resume` is alias for default skip-cache.
 - **Structured output:** `{"translation": str, "unknown_terms": [str], "notes": [str]}` via OpenAI-compatible `response_format=json_object` (both endpoints support it). No regex sentinel parsing.
 - **Zero-guessing rule:** unknown/ambiguous term → `unknown_terms[]` + inline `⟦he:<term>⟧` marker in translation. doc is `blocked_on_term`, not silently guessed. Increments question queue; does not reach vault.
 - **Output artifact:** content-addressed store `data/translations/<sha>/translation.md` + frontmatter `{source_doc_id, source_hash, model, policy_version, glossary_version, qa_results, marker_count}`. Hebrew source remains provenance anchor (frontmatter `source: raw/...`). Append-only ledger `data/translations/ledger.jsonl` (canonical `vault_root/data/translations/ledger.jsonl` with `ts` + `glossary_version` on each event). Events: `translation_started/completed`, `qa_result`, `blocked_on_term`, `question_answered` (review_queue), `retranslation_scheduled`.
-- **Bounded retries:** fixed max (e.g. 3), record attempts, quarantine on exhaustion — never `while True`.
+- **Bounded retries + self-heal:** chunk translation retries fixed max 3 (call_llm internal), plus per-doc QA self-heal fix loop up to `translation.fix_rounds` (default 3, CLI --fix-rounds / env TRANSLATE_FIX_ROUNDS) that re-prompts the LLM with QA failures (chunked for large docs to avoid 12k truncation); logs fix_attempt/qa_result/qa_failed ledger events and exits 1 fail-closed on exhaustion — never `while True`.
 
 ### 3b) Deterministic QA gate (scripted, no LLM judge)
 
@@ -90,7 +90,15 @@ CSV schema: `term_he,english,keep_source,notes,status,example_doc` — status en
 - **CLI:** `python scripts/translation_qa.py <store_dir> [--glossary PATH] [--vault-root PATH] [--json-out PATH]` — vault-root aware for source resolution; `--json-out` writes aggregated `[{file,meta,checks}]` JSON.
 - Any failure → quarantine → review queue. Batch report: pass rates, marker counts, glossary growth, blocked counts.
 
-### 3c) Prompt / translation instruction
+### 3c) Self-heal fix loop (QA → LLM repair)
+
+Integrated into `scripts/translate.py` after each doc`s `(full_translation = "
+
+".join(chunk_translations))` assembly: run `translation_qa.run_all(source_path, trans_body, meta, glossary, vault_root)`, filter `status==fail`, build repair prompt via `build_fix_prompt(source, prev, failures, glossary_slice, invariants)` and re-call `call_llm`. Loop up to `fix_rounds` (default 3). For large docs (>12k src or trans) the fix is chunked via `_build_chunked_fix_prompts` (re-uses `chunk_markdown` boundaries, per-chunk glossary/invariants slice, one LLM call per chunk, then `
+
+`.join) to avoid silent truncation — small docs use single whole-doc prompt. Each attempt logs `fix_attempt` (round, failures_before, chunked flag, src_len/trans_len) + `qa_result`; exhaustion writes `qa_failed` quarantine artifact (`fix_rounds_used`, `qa_failures[:5]`) and `sys.exit(1)` (fail-closed, stops token waste). Cached `qa_failed` artifacts also count toward exit 1 until `--force`. Mock path preserves invariants via `mock_translate`.
+
+### 3d) Prompt / translation instruction
 
 Lives in `data/translation_prompt.md` (editable, versioned with policy). Stage-5 "translation policy" document (`campaigns/<campaign>/translation-policy.md` for multi-campaign; `data/translation_policy.md` for single-corpus template mode):
 
@@ -173,14 +181,14 @@ Workflow: AI (MiniMax M2.7 / Kimi K2.7) produces **3–5 draft reference transla
 ```
 NEW  scripts/glossary_translate.py        # translation_seed → glossary_proposed.csv (MiniMax M2.7 proposes all; --mock for CI; harvests 2–3 context sentences)
 NEW  scripts/check_glossary.py            # lint: fails if unapproved rows exist (strips # comments, enum approved|proposed|keep_source|pending but only approved passes)
-NEW  scripts/translate.py                 # chunk → translate (MiniMax + allowlist mask word-boundary/maqaf-aware + filtered glossary + ⟦he:⟧ markers; sentinel-safe mock)
+MOD  scripts/translate.py                 # chunk → translate + self-heal QA fix loop (bounded fix_rounds, chunked for large docs, ledger fix_attempt/qa_failed, fail-closed) + allowlist
 NEW  scripts/translation_qa.py            # deterministic QA battery (residual_hebrew vault-root-aware, multi-word markers, word-boundary glossary checks)
 NEW  scripts/translation_reviewer.py      # Kimi K2.7 sampling reviewer (AskQE + marker-only glossary sweep; --sample/--seed deterministic)
 NEW  scripts/review_queue.py              # list|gen-packets|parse|clean for single queue (CSV source of truth; parents[2] vault resolution; ts+glossary_version ledger)
 NEW  data/domain_terms/glossary.csv       # editable glossary (committed template: # comment + headers + one example row; ! exception in .gitignore)
 NEW  data/translation_policy.md           # editable policy (template)
 NEW  data/translation_prompt.md           # prompt template (versioned)
-MOD  convert_config.json                  # translation: {base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path} + _comment
+MOD  convert_config.json                  # translation: {base_url, reviewer_base_url, api_key_env, model, reviewer_model, chunk_chars, review_sample, glossary_path, fix_rounds} + _comment (fix_rounds 3, env TRANSLATE_FIX_ROUNDS / --fix-rounds)
 MOD  docs/superpowers/plans/document_conversion_pipeline.md # stage-5 row + translation config block
 NEW  docs/human-review-queue.md           # queue instructions — single queue, ordered/grouped, when-not-to-use table
 NEW  docs/superpowers/specs/stage5-translation-spec-addendum.md # reality corrigendum: MiniMax/Kimi/allowlist/CSV vs Dicta-LM/markdown
