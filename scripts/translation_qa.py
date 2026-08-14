@@ -134,23 +134,30 @@ def _read_csv_skip_comments(path: Path) -> list[str]:
 def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
     """Load person names allowlist for residual_hebrew suppression.
 
-    Codename-aware: org codenames (data/person_names/codenames.txt) that
-    collide with Hebrew names are removed so they are not suppressed.
+    Codename-aware: org codenames that collide with Hebrew names are removed
+    so they are not suppressed. Primary source is the domain glossary
+    (data/domain_terms/glossary.csv — term_he with status approved/keep_source);
+    an optional data/person_names/codenames.txt is also read for manual overrides.
     """
+    import csv
+
     names: set[str] = set()
     candidates: list[Path] = []
     codename_candidates: list[Path] = []
+    glossary_candidates: list[Path] = []
     if vault_root is not None:
         candidates.append(vault_root / "data" / "person_names" / "first_names.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names_ranked.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names.txt")
         codename_candidates.append(vault_root / "data" / "person_names" / "codenames.txt")
+        glossary_candidates.append(vault_root / "data" / "domain_terms" / "glossary.csv")
     else:
         cur = Path.cwd().resolve()
         for p in [cur] + list(cur.parents):
             candidates.append(p / "data" / "person_names" / "first_names.txt")
             candidates.append(p / "data" / "person_names" / "last_names_ranked.txt")
             codename_candidates.append(p / "data" / "person_names" / "codenames.txt")
+            glossary_candidates.append(p / "data" / "domain_terms" / "glossary.csv")
     for p in candidates:
         if p.exists():
             try:
@@ -160,7 +167,7 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
                         names.add(t)
             except OSError:
                 pass
-    # Remove codenames from the allowlist (they must be translated, not suppressed)
+    # Remove codenames — glossary terms take precedence (domain dictionary)
     codenames: set[str] = set()
     for p in codename_candidates:
         if p.exists():
@@ -171,6 +178,22 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
                         codenames.add(t)
             except OSError:
                 pass
+    # Also load glossary term_he for approved/keep_source — primary codename source
+    for gp in glossary_candidates:
+        if gp.exists():
+            try:
+                text = gp.read_text(encoding="utf-8")
+                lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+                if lines:
+                    reader = csv.DictReader(lines)
+                    for row in reader:
+                        term = (row.get("term_he") or "").strip()
+                        status = (row.get("status") or "").strip()
+                        if term and status in ("approved", "keep_source"):
+                            codenames.add(term)
+            except OSError:
+                pass
+            break  # only first found glossary
     if codenames:
         names -= codenames
     return names

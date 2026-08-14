@@ -1,7 +1,0 @@
-# Org codenames that collide with common Hebrew given names.
-# Each term here has an English equivalent in data/domain_terms/glossary.csv
-# and MUST be translated, not masked as ⟦PERSON_n⟧.
-# One Hebrew term per line. Lines starting with # and empty lines are ignored.
-# Add one entry per codename, e.g.:
-ברק
-דניאל
