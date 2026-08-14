@@ -17,18 +17,20 @@
 Config: convert_config.json translation block:
   translation {base_url (\"\"), reviewer_base_url (\"\"), api_key_env (TRANSLATE_API_KEY),
                model (minimax-m2.7), reviewer_model (kimi-k2.7), chunk_chars (6000),
-               review_sample (0.2), glossary_path (data/domain_terms/glossary.csv)}
+               review_sample (0.2), glossary_path (data/domain_terms/glossary.csv),
+               fix_rounds (3)}
   Defaults: base_url \"\", reviewer_base_url \"\", chunk_chars 6000, review_sample 0.2,
-            glossary_path data/domain_terms/glossary.csv, model minimax-m2.7,
+            glossary_path data/domain_terms/glossary.csv, fix_rounds 3, model minimax-m2.7,
             reviewer_model kimi-k2.7, api_key_env TRANSLATE_API_KEY.
   Env precedence: TRANSLATE_BASE_URL primary, QMD_OPENAI_BASE_URL fallback;
   reviewer uses TRANSLATE_REVIEWER_BASE_URL override (see translation_reviewer.py).
+  fix_rounds precedence: CLI --fix-rounds > TRANSLATE_FIX_ROUNDS env > config > 3 (0=disable).
 Fail-fast if base_url missing. --mock for CI (mock is PERSON-sentinel aware: splits by
   ⟦PERSON_n⟧, only wraps remaining [א-ת]{2,} as ⟦he:…⟧ so sentinels are not marked).
 
 CLI:
   python scripts/translate.py [vault_root] [--input DIR] [--glossary PATH] [--out DIR]
-                              [--check] [--mock] [--force] [--resume] [--limit N]
+                              [--check] [--mock] [--force] [--resume] [--limit N] [--fix-rounds N]
   vault_root positional (default ".")
   --input DIR     corpus dir (default raw_md/raw auto-detect)
   --glossary PATH glossary.csv override (default translation.glossary_path or vault/data/domain_terms/glossary.csv)
@@ -38,6 +40,7 @@ CLI:
   --force         retranslate even if cached (content-addressed <sha> already exists)
   --resume        same as default (resume by hash, kept for docs compat)
   --limit N       limit files (0=all)
+  --fix-rounds N  max LLM fix rounds per doc after QA failures (default 3, 0=disable, env TRANSLATE_FIX_ROUNDS overrides config)
 """
 from __future__ import annotations
 
@@ -934,6 +937,8 @@ def translate_one_doc(md_file: Path, vault_root: Path, out_root: Path,
                       mock: bool, fix_rounds: int, chunk_chars: int,
                       no_mask: bool = False) -> dict:
     """Translate single file (no QA fix loop). Returns dict with translation,status etc."""
+    _ = fix_rounds  # kept for caller compat; loop is in translate_one_doc_with_fix
+    _ = out_root  # content-addressed store handled by caller (main)
     rel = md_file.relative_to(vault_root).as_posix() if md_file.is_relative_to(vault_root) else md_file.name
     raw_text = md_file.read_text(encoding="utf-8")
     if is_english_only_doc(raw_text):
@@ -981,7 +986,7 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
         if mock:
             fixed = mock_translate(raw_text, glossary_for_chunk(raw_text, glossary), full_invariants)
             new_body = fixed["translation"]
-            fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
+            fix_unknown_terms.extend(re.findall(r"⟦he:([^⟧]+)⟧", new_body))
         else:
             # For large docs, avoid silent 12k truncation by chunking the fix
             threshold = max(12000, chunk_chars * 2)
@@ -1003,7 +1008,7 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
                         ct = resp.get("translation", "")
                         chunk_translations.append(ct)
                         chunk_unknown.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
-                        chunk_unknown.extend(re.findall(r"⟦he:[^⟧]+⟧", ct))
+                        chunk_unknown.extend(re.findall(r"⟦he:([^⟧]+)⟧", ct))
                     except Exception as e:
                         last_err = str(e)[:500]
                         chunk_failed = True
@@ -1029,7 +1034,7 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
                 resp = call_llm(base_url, api_key, model, fix_prompt)
                 new_body = resp.get("translation", "")
                 fix_unknown_terms.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
-                fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
+                fix_unknown_terms.extend(re.findall(r"⟦he:([^⟧]+)⟧", new_body))
             except Exception as e:
                 all_fix_attempts.append({"round": fix_rounds_used, "error": str(e)[:500], "failures_before": failures, "chunked": False, "src_len": len(raw_text), "trans_len": len(trans_body)})
                 break
@@ -1042,7 +1047,7 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
     else:
         has_markers = "⟦he:" in trans_body
         final_status = "blocked_on_term" if has_markers else "completed"
-    marker_terms = [m[4:-1] for m in re.findall(r"⟦he:[^⟧]+⟧", trans_body)]
+    marker_terms = re.findall(r"⟦he:([^⟧]+)⟧", trans_body)
     recomputed_unknown = sorted(set(marker_terms + [str(x).strip() for x in fix_unknown_terms if str(x).strip()]))
     # When fix was attempted, merge original unknown_terms (preservation failures) with recomputed
     # so blocked docs aren't hidden if fix resolves QA but leaves invariant gaps
