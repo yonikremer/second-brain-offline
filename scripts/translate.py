@@ -2,9 +2,13 @@
 """Translate Hebrew markdown chunks to English with glossary + name guard.
 
 - Structural chunking at heading/paragraph boundaries (never mid-sentence/table/code).
+- English-only docs are skipped (no Hebrew → ledger skipped_english, no output file).
+- Preservation by verification (not masking): person names, English spans, and
+  URLs/file-paths are extracted from the source chunk, passed to the LLM as
+  explicit verbatim-context, and verified to appear in the output.
 - Filtered glossary: only terms occurring in chunk are injected.
 - Person-name guard: exact-match against data/person_names/ (592 first + 818 last),
-  masked to ⟦PERSON_n⟧ before LLM, unmasked after.
+  extracted + verified (not masked).
 - Structured output {translation, unknown_terms, notes} via response_format=json_object.
 - Zero-guessing: unknown terms → ⟦he:<term>⟧ markers, blocked_on_term ledger.
 - Content-addressed store data/translations/<sha>/translation.md + ledger.jsonl.
@@ -54,12 +58,33 @@ _scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
+import md_mask  # type: ignore
+
 PERSON_OPEN = "⟦PERSON_"
 PERSON_CLOSE = "⟧"
+EN_OPEN = "⟦EN_"
+EN_CLOSE = "⟧"
 HE_MARKER_FMT = "⟦he:{term}⟧"
 
 # Hebrew char range (narrow א-ת) — word runs used for mock/qa sentinel-aware marking
 HEBREW_WORD_RE = re.compile(r"[א-ת]{2,}")
+# English preservation: Latin-script spans that must survive verbatim (verified, not masked)
+_EN_SENTINEL_RE = re.compile(re.escape(EN_OPEN) + r"\d+" + re.escape(EN_CLOSE))
+_PERSON_SENTINEL_RE = re.compile(re.escape(PERSON_OPEN) + r"\d+" + re.escape(PERSON_CLOSE))
+# Contiguous Latin-script run — excludes '/' so file-paths are not merged into English spans
+_EN_SPAN_RE = re.compile(r"[A-Za-z]{2,}(?:[ \t]*[A-Za-z0-9\-'\".,;:()&`]+)*")
+# URLs and file-paths to preserve verbatim
+_URL_RE = re.compile(r"https?://[^\s<>\[\]()\"']+|www\.[^\s<>\[\]()\"']+")
+_FILEPATH_RE = re.compile(
+    r"(?:[A-Za-z]:)?[\\/][\w.\-/\\]+|"  # /abs/path or C:\path or \path
+    r"\b[\w.\-]+\.(?:md|py|json|csv|txt|pdf|docx|xlsx|png|jpg|jpeg|yaml|yml|toml|sh|js|ts)\b|"
+    r"\b[\w.\-]+/[\w.\-/]*"
+)
+# YAML frontmatter and code sections — must be preserved verbatim and in order
+_YAML_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+_FENCED_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_CODE_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 
 
 def get_ledger_path(vault_root: Path, out_root: Path | None = None) -> Path:
@@ -247,6 +272,217 @@ def unmask_person_names(text: str, mapping: list[str]) -> str:
     return text
 
 
+def is_english_only_doc(text: str, he_threshold: int = 10, ratio_threshold: float = 0.02) -> bool:
+    """Return True for docs that are entirely (or effectively) English.
+
+    Strips frontmatter + code fences before counting so English docs with
+    YAML/code aren't misclassified. Heuristic: Hebrew char count < he_threshold
+    AND Hebrew/(Hebrew+Latin) < ratio_threshold, with at least some Latin.
+    This matches "entirely English" while tolerating stray Hebrew characters.
+    """
+    body = text
+    if body.startswith("---\n"):
+        end = body.find("\n---\n", 4)
+        if end != -1:
+            body = body[end + 5:]
+    # Strip code fences — they may contain Hebrew-like chars in comments
+    body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    body = re.sub(r"`[^`]*`", "", body)
+    he_chars = len(re.findall(r"[א-ת]", body))
+    latin_chars = len(re.findall(r"[A-Za-z]", body))
+    if latin_chars < 20:
+        return False
+    if he_chars == 0:
+        return True
+    if he_chars < he_threshold and (he_chars / max(he_chars + latin_chars, 1)) < ratio_threshold:
+        return True
+    return False
+
+
+def mask_english_spans(text: str) -> tuple[str, list[str]]:
+    """Legacy: mask contiguous Latin-script spans to EN sentinels.
+
+    Kept for tests/back-compat. New flow uses extract_english_spans() +
+    verify_preserved() — LLM sees raw English with preservation context
+    instead of sentinels.
+    """
+    # Split by PERSON sentinels so we don't capture the word "PERSON"
+    p_parts = _PERSON_SENTINEL_RE.split(text)
+    p_sents = _PERSON_SENTINEL_RE.findall(text)
+    en_mapping: list[str] = []
+    out_parts: list[str] = []
+    for idx, seg in enumerate(p_parts):
+        # Within each non-PERSON segment, mask English spans
+        def _repl(m: re.Match) -> str:
+            span = m.group(0).strip()
+            # Require at least 2 letters and at least one word with 2+ letters
+            if len(re.findall(r"[A-Za-z]", span)) < 2:
+                return m.group(0)
+            # Skip very short fragments that are mostly punctuation
+            if len(span) < 2:
+                return m.group(0)
+            sentinel = f"{EN_OPEN}{len(en_mapping)}{EN_CLOSE}"
+            en_mapping.append(span)
+            return sentinel
+        # Only mask spans that look like real English (at least 2 consecutive letters)
+        masked_seg = _EN_SPAN_RE.sub(_repl, seg)
+        out_parts.append(masked_seg)
+        if idx < len(p_sents):
+            out_parts.append(p_sents[idx])
+    return "".join(out_parts), en_mapping
+
+
+def unmask_english_spans(text: str, mapping: list[str]) -> str:
+    for i, span in enumerate(mapping):
+        text = text.replace(f"{EN_OPEN}{i}{EN_CLOSE}", span)
+    return text
+
+
+# ── Preservation-by-verification (LLM sees raw text + invariants as context) ──
+
+def extract_english_spans(text: str) -> list[str]:
+    """Extract contiguous Latin-script spans that must be preserved verbatim.
+
+    URLs/paths are excluded here (handled by extract_urls_and_paths).
+    A newline sentinel breaks spans that had a URL in the middle.
+    """
+    # Mask URLs/paths first so they don't pollute English spans
+    masked = _URL_RE.sub("\n", text)
+    masked = _FILEPATH_RE.sub("\n", masked)
+    spans: list[str] = []
+    for m in _EN_SPAN_RE.finditer(masked):
+        span = m.group(0).strip()
+        if len(span) < 2 or len(re.findall(r"[A-Za-z]", span)) < 2:
+            continue
+        # Must contain at least one 2+ letter word (avoid isolated numbers/punct)
+        if not re.search(r"[A-Za-z]{2,}", span):
+            continue
+        if span not in spans:
+            spans.append(span)
+    return spans
+
+
+def extract_urls_and_paths(text: str) -> list[str]:
+    """Extract URLs and file-paths that must be preserved verbatim."""
+    urls: list[str] = []
+    for m in _URL_RE.finditer(text):
+        s = m.group(0).strip().rstrip(".,;:)]}'\"")
+        if len(s) >= 8 and s not in urls:
+            urls.append(s)
+    # Remove URLs before path scan so we don't capture fragments like 's://'
+    masked = _URL_RE.sub(" ", text)
+    paths: list[str] = []
+    for m in _FILEPATH_RE.finditer(masked):
+        s = m.group(0).strip().rstrip(".,;:)]}'\"")
+        if len(s) < 3:
+            continue
+        if "/" not in s and "\\" not in s and "." not in s:
+            continue
+        # Avoid tiny fragments and duplicates of URLs
+        if s in urls or s in paths:
+            continue
+        paths.append(s)
+    return urls + paths
+
+
+def extract_person_names(text: str, first: set[str], last: set[str]) -> list[str]:
+    """Extract person names from text using the same allowlist logic as masking."""
+    _, mapping = mask_person_names(text, first, last)
+    return mapping
+
+
+def extract_yaml_frontmatter(text: str) -> list[str]:
+    m = _YAML_RE.search(text)
+    return [m.group(0)] if m else []
+
+
+def extract_code_sections(text: str) -> list[str]:
+    """Extract fenced + inline code sections in source order."""
+    return [m.group(0) for m in _CODE_RE.finditer(text)]
+
+
+def extract_preservation_invariants(text: str, first: set[str], last: set[str]) -> dict:
+    """Collect all invariants that must survive translation verbatim.
+
+    Returns dict with keys: person_names, english_spans, urls_and_paths,
+    yaml_frontmatter, code_sections
+    Each is a deduplicated list in order of appearance (except yaml which is 0/1).
+    Code/YAML are extracted first and masked out before english/url extraction
+    to avoid double-counting text inside code.
+    """
+    yaml_blocks = extract_yaml_frontmatter(text)
+    code_blocks = extract_code_sections(text)
+    # Mask yaml + code so english/url extraction ignores their interior
+    masked = _YAML_RE.sub("\n", text)
+    masked = _CODE_RE.sub("\n", masked)
+    return {
+        "yaml_frontmatter": yaml_blocks,
+        "code_sections": code_blocks,
+        "person_names": extract_person_names(masked, first, last),
+        "english_spans": extract_english_spans(masked),
+        "urls_and_paths": extract_urls_and_paths(masked),
+    }
+
+
+def verify_preserved(source_invariants: list[str], translation: str) -> list[str]:
+    """Return subset of source_invariants missing verbatim in translation."""
+    return [s for s in source_invariants if s not in translation]
+
+
+def verify_all_preserved(invariants: dict, translation: str) -> dict:
+    """Verify all categories; returns {category: [missing,...]} for failures."""
+    missing: dict[str, list[str]] = {}
+    for cat, items in invariants.items():
+        bad = verify_preserved(items, translation)
+        if bad:
+            missing[cat] = bad
+    return missing
+
+
+def verify_ordered(source_items: list[str], translation: str) -> list[str]:
+    """Return items that are out of order (present but monotonic violation)."""
+    positions: list[int | None] = []
+    for item in source_items:
+        try:
+            positions.append(translation.index(item))
+        except ValueError:
+            positions.append(None)
+    present = [(i, p) for i, p in enumerate(positions) if p is not None]
+    out: list[str] = []
+    for k in range(1, len(present)):
+        if present[k][1] < present[k - 1][1]:
+            out.append(source_items[present[k][0]])
+    return out
+
+
+def verify_all_ordered(invariants: dict, translation: str) -> dict:
+    """Check order per category; returns {category: [out_of_order,...]}."""
+    bad: dict[str, list[str]] = {}
+    for cat, items in invariants.items():
+        if len(items) <= 1:
+            continue
+        oo = verify_ordered(items, translation)
+        if oo:
+            bad[cat] = oo
+    return bad
+
+
+def verify_global_order(source_text: str, invariants: dict, translation: str) -> list[str]:
+    """Check that all preserved pieces appear in same relative order as in source."""
+    all_occurrences: list[tuple[int, str]] = []
+    for items in invariants.values():
+        for val in items:
+            idx = source_text.find(val)
+            if idx != -1:
+                all_occurrences.append((idx, val))
+    all_occurrences.sort(key=lambda x: x[0])
+    ordered_vals = [v for _, v in all_occurrences]
+    if len(ordered_vals) <= 1:
+        return []
+    return verify_ordered(ordered_vals, translation)
+
+
+
 def chunk_markdown(md_text: str, max_chars: int = 6000) -> list[dict]:
     """Split at heading boundaries, then paragraph boundaries if chunk exceeds budget.
     Never mid-code-block / mid-frontmatter / mid-table (table handled as paragraph).
@@ -357,7 +593,7 @@ def glossary_for_chunk(chunk_text: str, glossary: list[dict]) -> list[dict]:
 
 
 def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
-                 prev_tail: str = "") -> str:
+                 prev_tail: str = "", invariants: dict | None = None) -> str:
     glossary_block = ""
     if glossary_rows:
         lines = []
@@ -377,18 +613,39 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
     if prev_tail:
         prev_block = f"Previous chunk tail (context only, do not re-emit):\n{prev_tail[:800]}\n\n"
 
-    person_rule = (
-        "Keep person names in Hebrew — tokens like ⟦PERSON_0⟧ are person names, do not translate them.\n"
-    )
+    # Preservation context: invariants the LLM sees verbatim and must copy exactly
+    preserve_block = ""
+    if invariants:
+        parts: list[str] = []
+        for cat, label in [("yaml_frontmatter", "YAML frontmatter (keep exactly, first block)"),
+                           ("code_sections", "Code sections (fenced/inline — keep exactly, in order)"),
+                           ("person_names", "Person names (Hebrew — keep exactly, in order)"),
+                           ("english_spans", "English spans (Latin — keep verbatim, in order)"),
+                           ("urls_and_paths", "URLs/file-paths (keep verbatim, in order)")]:
+            items = invariants.get(cat) or []
+            if items:
+                # Cap to keep prompt small; full list still verified after
+                shown = items[:30]
+                # For yaml/code, trim long blocks for prompt but verification uses full value
+                def _short(s: str) -> str:
+                    return s[:300] + ("…(truncated)" if len(s) > 300 else "")
+                shown_short = [_short(s) for s in shown]
+                parts.append(f"{label}: {json.dumps(shown_short, ensure_ascii=False)}")
+                if len(items) > 30:
+                    parts[-1] += f" (+{len(items)-30} more)"
+        if parts:
+            preserve_block = "Preserve verbatim IN ORDER — these strings from the source MUST appear exactly and in the same relative order in the output (code/YAML frontmatter included):\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
+
     return (
         f"Translate this Hebrew markdown chunk to faithful technical English.\n"
         f"Rules:\n"
-        f"- Preserve headings, lists, tables, code fences exactly (same counts).\n"
+        f"- Preserve headings, lists, tables, code fences exactly (same counts) and in the same order.\n"
         f"- Use glossary renderings exactly where they appear.\n"
-        f"- {person_rule}"
+        f"- Person names, English/URLs/code/YAML listed below must be copied verbatim and kept in the same relative order as in the source — do not translate, transliterate, reorder, or alter them.\n"
         f"- Never invent translations for unknown terms — list them in unknown_terms.\n"
         f"- Output JSON: {{\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}}\n\n"
         f"{glossary_block}"
+        f"{preserve_block}"
         f"{prev_block}"
         f"Section: {section_path}\n\n"
         f"Chunk to translate:\n{chunk_text}\n"
@@ -436,26 +693,37 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
     raise RuntimeError(last_err or "LLM exhausted retries")
 
 
-def mock_translate(chunk_text: str, glossary_rows: list[dict]) -> dict:
-    # Deterministic mock: apply glossary substitutions, wrap Hebrew remainder
+def mock_translate(chunk_text: str, glossary_rows: list[dict], invariants: dict | None = None) -> dict:
+    # Deterministic mock: apply glossary substitutions, wrap Hebrew remainder.
+    # Raw English/URLs/names/code/YAML stay untouched — mirrors real LLM in preservation mode.
     out = chunk_text
     for r in glossary_rows:
         term = r.get("term_he", "")
         eng = r.get("english", "")
         if term and eng and term in out:
             out = out.replace(term, eng)
-    # Mark remaining Hebrew spans as ⟦he:..⟧ (zero-guessing simulation).
-    # Exclude PERSON sentinels: split by sentinel pattern, only mark Hebrew
-    # in non-sentinel segments so ⟦PERSON_n⟧ never gets wrapped.
-    PERSON_RE = re.compile(re.escape(PERSON_OPEN) + r"\d+" + re.escape(PERSON_CLOSE))
-    parts = PERSON_RE.split(out)
-    sentinels = PERSON_RE.findall(out)
-    marked_parts: list[str] = []
-    for i, seg in enumerate(parts):
-        marked_parts.append(HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
-        if i < len(sentinels):
-            marked_parts.append(sentinels[i])
-    out = "".join(marked_parts)
+    # Protect invariants from Hebrew wrapping (person names, english, urls, code, yaml)
+    if invariants:
+        protected = []
+        for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
+            for v in invariants.get(cat, []):
+                if v and v not in protected:
+                    protected.append(v)
+        if protected:
+            # Build alternation sorted longest first to avoid substring shadowing
+            protected_sorted = sorted(protected, key=len, reverse=True)
+            pat = re.compile("|".join(re.escape(p) for p in protected_sorted))
+            parts = pat.split(out)
+            sentinels = pat.findall(out)
+            wrapped: list[str] = []
+            for i, seg in enumerate(parts):
+                wrapped.append(HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                if i < len(sentinels):
+                    wrapped.append(sentinels[i])
+            out = "".join(wrapped)
+            return {"translation": out, "unknown_terms": [], "notes": ["mock"]}
+    # Fallback: wrap all Hebrew
+    out = HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), out)
     return {"translation": out, "unknown_terms": [], "notes": ["mock"]}
 
 
@@ -469,6 +737,7 @@ def main(argv=None):
     ap.add_argument("--mock", action="store_true", help="offline mock (no LLM)")
     ap.add_argument("--force", action="store_true", help="retranslate even if cached")
     ap.add_argument("--resume", action="store_true", help="same as default (kept for docs compat)")
+    ap.add_argument("--no-mask", action="store_true", help="disable md_mask placeholder masking (debug)")
     ap.add_argument("--limit", type=int, default=0, help="limit files (0=all)")
     args = ap.parse_args(argv)
 
@@ -544,6 +813,7 @@ def main(argv=None):
     name_candidates: set[str] = set()
     translated = 0
     blocked = 0
+    skipped_english = 0
 
     for md_file in md_files:
         rel = md_file.relative_to(vault_root).as_posix() if md_file.is_relative_to(vault_root) else md_file.name
@@ -551,6 +821,24 @@ def main(argv=None):
             raw_text = md_file.read_text(encoding="utf-8")
         except OSError as e:
             print(f" skip {rel}: {e}", file=sys.stderr)
+            continue
+
+        # Entirely-English docs: skip translation (already English, nothing to do)
+        if is_english_only_doc(raw_text):
+            src_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+            event = {
+                "event": "skipped_english",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source_doc": rel,
+                "source_hash": src_hash,
+                "model": model,
+                "glossary_version": glossary_version,
+                "status": "skipped_english",
+            }
+            with open(ledger_path, "a", encoding="utf-8") as lf:
+                lf.write(json.dumps(event, ensure_ascii=False) + "\n")
+            skipped_english += 1
+            print(f"  {rel}: skipped_english (no Hebrew)")
             continue
 
         src_hash = hashlib.sha256(raw_text.encode()).hexdigest()
@@ -571,20 +859,84 @@ def main(argv=None):
         for ch in chunks:
             chunk_text = ch["chunk_text"]
             section_path = ch["section_path"]
-            # Mask person names
-            masked, mapping = mask_person_names(chunk_text, first_names, last_names)
-            if mapping:
-                name_candidates.update(mapping)
-            # Filtered glossary
-            g_rows = glossary_for_chunk(masked, glossary)
-            prompt = build_prompt(masked, section_path, g_rows, prev_tail)
+            # Extract invariants (person names, English spans, URLs/paths) — passed as
+            # preservation context to LLM, not masked. LLM sees raw text.
+            invariants = extract_preservation_invariants(chunk_text, first_names, last_names)
+            if invariants["person_names"]:
+                name_candidates.update(invariants["person_names"])
+            # Filtered glossary (use raw chunk for Hebrew term matching)
+            g_rows = glossary_for_chunk(chunk_text, glossary)
 
-            if args.mock:
-                res = mock_translate(masked, g_rows)
+            # ── Masked translation path (md_mask) ──
+            use_mask = not args.no_mask and not args.mock
+            if use_mask:
+                opts = md_mask.MdOptions(
+                    translate_frontmatter=False,
+                    translate_multiline_code=False,
+                    translate_latex=False,
+                    translate_link_text=True,
+                )
+                filt = md_mask.filter_markdown_lines(chunk_text.split("\n"), opts)
+                segs = md_mask.split_markdown_segments(filt.content_lines, filt.source_line_numbers)
+                cell_texts = md_mask.get_table_cell_texts(filt.maps)
+                SEG_DELIM = "\n---SEG---\n"
+                if segs.texts_to_translate:
+                    seg_prompt = build_prompt(
+                        SEG_DELIM.join(segs.texts_to_translate),
+                        section_path,
+                        g_rows,
+                        prev_tail,
+                        invariants,
+                    )
+                    res_seg = call_llm(base_url, api_key, model, seg_prompt)
+                    translated_seg_text = res_seg["translation"]
+                    translated_segments = translated_seg_text.split(SEG_DELIM)
+                    if len(translated_segments) != len(segs.texts_to_translate):
+                        raise RuntimeError(
+                            f"Segment count mismatch: sent {len(segs.texts_to_translate)}, "
+                            f"got {len(translated_segments)} — model did not preserve delimiters"
+                        )
+                else:
+                    translated_segments = []
+                    res_seg = {"unknown_terms": [], "notes": []}
+                if cell_texts:
+                    translated_cells: list[str] = []
+                    for cell in cell_texts:
+                        cell_prompt = build_prompt(cell, section_path, g_rows, "", None)
+                        cr = call_llm(base_url, api_key, model, cell_prompt)
+                        translated_cells.append(cr["translation"])
+                    md_mask.inject_translated_table_cells(filt.maps, translated_cells)
+                merged_lines = md_mask.merge_markdown_segments(segs.line_segments, translated_segments)
+                trans = md_mask.restore_placeholders("\n".join(merged_lines), filt.maps)
+                res = {
+                    "translation": trans,
+                    "unknown_terms": res_seg.get("unknown_terms", []),
+                    "notes": res_seg.get("notes", []),
+                }
             else:
-                res = call_llm(base_url, api_key, model, prompt)
-
-            trans = res["translation"]
+                prompt = build_prompt(chunk_text, section_path, g_rows, prev_tail, invariants)
+                if args.mock:
+                    res = mock_translate(chunk_text, g_rows, invariants)
+                else:
+                    res = call_llm(base_url, api_key, model, prompt)
+                trans = res["translation"]
+            # Verify invariants preserved verbatim + order — deterministic post-check
+            missing = verify_all_preserved(invariants, trans)
+            if missing:
+                for cat, items in missing.items():
+                    res.setdefault("notes", []).append(f"preserve_fail:{cat}:{items}")
+                for items in missing.values():
+                    doc_unknown.extend(items)
+            order_bad = verify_all_ordered(invariants, trans)
+            global_bad = verify_global_order(chunk_text, invariants, trans)
+            if order_bad:
+                for cat, items in order_bad.items():
+                    res.setdefault("notes", []).append(f"order_fail:{cat}:{items}")
+                for items in order_bad.values():
+                    doc_unknown.extend(items)
+            if global_bad:
+                res.setdefault("notes", []).append(f"global_order_fail:{global_bad}")
+                doc_unknown.extend(global_bad)
             # Inject markers for unknown terms that aren't already marked
             for ut in res.get("unknown_terms", []):
                 ut = str(ut).strip()
@@ -597,8 +949,6 @@ def main(argv=None):
                 if ut:
                     doc_unknown.append(ut)
 
-            # Unmask person names
-            trans = unmask_person_names(trans, mapping)
             chunk_translations.append(trans)
             # Context tail for next chunk
             prev_tail = trans[-400:] if trans else ""
@@ -651,7 +1001,7 @@ def main(argv=None):
                 f.write(n + "\n")
         print(f"Name candidates: {len(name_candidates)} unique -> {cand_path}")
 
-    print(f"Done: {translated} completed, {blocked} blocked_on_term -> {out_root}")
+    print(f"Done: {translated} completed, {blocked} blocked_on_term, {skipped_english} skipped_english -> {out_root}")
 
 
 if __name__ == "__main__":

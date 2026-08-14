@@ -4,7 +4,8 @@
 Checks (scripted, no LLM judge):
   residual_hebrew_ratio, untranslated_block, glossary_retention,
   heading_fidelity, structure_fidelity, numeric_fidelity,
-  length_ratio, markup_integrity, marker_count
+  length_ratio, markup_integrity, marker_count,
+  preserved_invariants (names + English spans + URLs/paths — extracted from source, verified verbatim in output)
   (glossary_consistency lives in reviewer via marker-only sweep, not here)
 
 Thresholds (pre-calibration placeholders, fit from Phase-0 references):
@@ -39,6 +40,88 @@ FENCE_RE = re.compile(r"```")
 LIST_RE = re.compile(r"^\s*[-*]\s+", re.MULTILINE)
 TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
 NUM_RE = re.compile(r"\b\d[\d.,]*\b")
+
+# Table fidelity: strict GFM table invariants (highest-risk construct)
+_TABLE_SEP_QA_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
+
+
+def _split_row_cells(row: str) -> list[str]:
+    parts: list[str] = []
+    cur = ""
+    j = 0
+    while j < len(row):
+        if row[j] == "\\" and j + 1 < len(row) and row[j + 1] == "|":
+            cur += "\\|"
+            j += 2
+            continue
+        if row[j] == "|":
+            parts.append(cur)
+            cur = ""
+            j += 1
+            continue
+        cur += row[j]
+        j += 1
+    parts.append(cur)
+    if parts and parts[0].strip() == "":
+        parts = parts[1:]
+    if parts and parts[-1].strip() == "":
+        parts = parts[:-1]
+    return parts
+
+
+def _parse_tables(text: str) -> list[list[list[str]]]:
+    """Parse GFM tables into list of tables, each table is list of rows, each row is list of cells."""
+    lines = text.split("\n")
+    tables: list[list[list[str]]] = []
+    i = 0
+    while i < len(lines):
+        if i + 1 < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[i]) and _TABLE_SEP_QA_RE.match(lines[i + 1]):
+            rows: list[list[str]] = []
+            rows.append([c.strip() for c in _split_row_cells(lines[i])])
+            i += 2
+            while i < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[i]) and not _TABLE_SEP_QA_RE.match(lines[i]):
+                rows.append([c.strip() for c in _split_row_cells(lines[i])])
+                i += 1
+            tables.append(rows)
+            continue
+        i += 1
+    return tables
+
+
+def _collect_separators(text: str) -> list[str]:
+    return [ln.strip() for ln in text.split("\n") if _TABLE_SEP_QA_RE.match(ln)]
+
+
+def check_table_fidelity(source_body: str, trans_body: str) -> dict:
+    """Fail if table column counts, row counts, or separator alignment drift."""
+    src_tables = _parse_tables(source_body)
+    trans_tables = _parse_tables(trans_body)
+    issues: list[str] = []
+    if len(src_tables) != len(trans_tables):
+        return {
+            "check": "table_fidelity",
+            "status": "fail",
+            "issues": [f"table count: source {len(src_tables)} vs translation {len(trans_tables)}"],
+        }
+    src_seps = _collect_separators(source_body)
+    trans_seps = _collect_separators(trans_body)
+    if len(src_seps) != len(trans_seps):
+        issues.append(f"separator rows: source {len(src_seps)} vs translation {len(trans_seps)}")
+    else:
+        for idx, (s, t) in enumerate(zip(src_seps, trans_seps)):
+            if s != t:
+                if s.replace(" ", "") != t.replace(" ", ""):
+                    issues.append(f"table {idx} separator changed: {s!r} -> {t!r}")
+    for ti, (sr, tr) in enumerate(zip(src_tables, trans_tables)):
+        if len(sr) != len(tr):
+            issues.append(f"table {ti} row count: source {len(sr)} vs translation {len(tr)}")
+            continue
+        for ri, (src_row, trans_row) in enumerate(zip(sr, tr)):
+            if len(src_row) != len(trans_row):
+                issues.append(
+                    f"table {ti} row {ri} column count: source {len(src_row)} vs translation {len(trans_row)}: {src_row!r} vs {trans_row!r}"
+                )
+    return {"check": "table_fidelity", "status": "fail" if issues else "pass", "issues": issues}
 
 
 def _read_csv_skip_comments(path: Path) -> list[str]:
@@ -260,12 +343,64 @@ def check_marker_count(body: str) -> dict:
     }
 
 
+def check_preserved_invariants(source_body: str, trans_body: str, vault_root: Path | None = None) -> dict:
+    """Verify names, English spans, URLs/paths, code and YAML from source appear verbatim and in order.
+
+    Reuses translate.py extractors so QA and translation share one definition.
+    Fail is quarantining — a dropped or reordered URL/name/code block must not reach the vault.
+    """
+    # Use raw source for global order (yaml at top, code blocks in place)
+    raw_source = source_body
+    try:
+        import translate as tmod  # type: ignore
+        if vault_root is not None:
+            first, last = tmod.load_person_names(vault_root)
+        else:
+            first, last = set(), set()
+        invariants = tmod.extract_preservation_invariants(raw_source, first, last)
+        missing = tmod.verify_all_preserved(invariants, trans_body)
+        order_bad = tmod.verify_all_ordered(invariants, trans_body)
+        global_bad = tmod.verify_global_order(raw_source, invariants, trans_body)
+    except Exception:
+        # Fallback: lightweight regex extraction if translate import fails
+        en_spans = re.findall(r"[A-Za-z]{2,}(?:[ \t]*[A-Za-z0-9\-'\".,;:()&`]+)*", raw_source)
+        en_spans = [s.strip() for s in en_spans if len(s.strip()) >= 2 and len(re.findall(r"[A-Za-z]", s)) >= 2]
+        url_spans = re.findall(r"https?://[^\s<>\[\]()\"']+|www\.[^\s<>\[\]()\"']+", raw_source)
+        missing = {}
+        for cat, items in [("english_spans", list(dict.fromkeys(en_spans))), ("urls_and_paths", list(dict.fromkeys(url_spans)))]:
+            bad = [s for s in items if s not in trans_body]
+            if bad:
+                missing[cat] = bad[:10]
+        invariants = {}
+        order_bad = {}
+        global_bad = []
+    if missing or order_bad or global_bad:
+        result: dict = {
+            "check": "preserved_invariants",
+            "status": "fail",
+            "source_counts": {k: len(v) for k, v in invariants.items()} if invariants else {},
+        }
+        if missing:
+            result["missing"] = {k: v[:10] for k, v in missing.items()}
+        if order_bad:
+            result["out_of_order"] = {k: v[:10] for k, v in order_bad.items()}
+        if global_bad:
+            result["global_out_of_order"] = global_bad[:10]
+        return result
+    return {
+        "check": "preserved_invariants",
+        "status": "pass",
+        "source_counts": {k: len(v) for k, v in invariants.items()} if invariants else {},
+    }
+
+
 def run_all(source_path: Path | None, trans_body: str, trans_meta: dict, glossary: list[dict], vault_root: Path | None = None) -> list[dict]:
     source_body = ""
+    raw_source = ""
     if source_path and source_path.exists():
         try:
-            raw = source_path.read_text(encoding="utf-8")
-            _, source_body = _strip_frontmatter(raw)
+            raw_source = source_path.read_text(encoding="utf-8")
+            _, source_body = _strip_frontmatter(raw_source)
             # For source, also strip frontmatter markers if any
         except OSError:
             pass
@@ -274,17 +409,24 @@ def run_all(source_path: Path | None, trans_body: str, trans_meta: dict, glossar
     checks.append(check_residual_hebrew(trans_body, vault_root=vault_root))
     checks.append(check_untranslated_block(trans_body))
     checks.append(check_glossary_retention(trans_body, glossary))
-    if source_body:
-        checks.append(check_heading_fidelity(source_body, trans_body))
-        checks.append(check_structure_fidelity(source_body, trans_body))
-        checks.append(check_numeric_fidelity(source_body, trans_body))
-        checks.append(check_length_ratio(source_body, trans_body))
+    if source_body or raw_source:
+        # Use stripped body for structural checks (yaml would pollute them)
+        body_for_struct = source_body if source_body else raw_source
+        checks.append(check_heading_fidelity(body_for_struct, trans_body))
+        checks.append(check_structure_fidelity(body_for_struct, trans_body))
+        checks.append(check_numeric_fidelity(body_for_struct, trans_body))
+        checks.append(check_length_ratio(body_for_struct, trans_body))
+        checks.append(check_table_fidelity(body_for_struct, trans_body))
+        # Preserved invariants needs raw source to check yaml/frontmatter + code order
+        checks.append(check_preserved_invariants(raw_source if raw_source else source_body, trans_body, vault_root=vault_root))
     else:
         # Still check length/markers even without source
         checks.append({"check": "heading_fidelity", "status": "skip", "note": "no source"})
         checks.append({"check": "structure_fidelity", "status": "skip", "note": "no source"})
         checks.append({"check": "numeric_fidelity", "status": "skip", "note": "no source"})
         checks.append({"check": "length_ratio", "status": "pass", "value": len(trans_body) / 1000, "note": "no source, skip ratio"})
+        checks.append({"check": "table_fidelity", "status": "skip", "note": "no source"})
+        checks.append({"check": "preserved_invariants", "status": "skip", "note": "no source"})
     checks.append(check_markup_integrity(trans_body))
     checks.append(check_marker_count(trans_body))
     return checks
