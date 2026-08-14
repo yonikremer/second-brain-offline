@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """MiniMax M2.7 bulk-proposes English for every term in translation_seed.csv.
 
-Input:  data/domain_terms/translation_seed.csv (term,lang,surface_variants,corpus_count,log_ratio,...)
+Input:  data/domain_terms/translation_seed.csv (columns: term,lang,suggested_en,example_doc,
+        surface_variants,corpus_count,log_ratio,... — term/lang/suggested_en/example_doc are primary)
         corpus: raw_md/ (rglob *.md) else raw/ — 2-3 real context sentences per term, not invented.
 Output: data/domain_terms/glossary_proposed.csv
 
@@ -10,6 +11,16 @@ Config: convert_config.json translation block:
 Env: TRANSLATE_BASE_URL / TRANSLATE_API_KEY or QMD_OPENAI_* fallback.
 Fail-fast if keys missing (no silent fallback).  --mock for CI without LLM.
 Prompt: JSON {term_he, english, keep_source, notes} — keep_source for internal names/part numbers.
+Mock: mixed lang reuses suggested_en; otherwise EN_{term} fixture (notes=mock).
+
+CLI:
+  python scripts/glossary_translate.py [vault_root] [--input PATH] [--out PATH] [--limit N] [--model ID] [--mock]
+  vault_root positional (default ".")
+  --input PATH  translation_seed.csv path (default vault/data/domain_terms/translation_seed.csv)
+  --out PATH    output glossary_proposed.csv (default vault/data/domain_terms/glossary_proposed.csv)
+  --limit N     limit terms (0=all, for smoke tests)
+  --model ID    override model id (default translation.model or minimax-m2.7)
+  --mock        offline mock (no LLM call, EN_{term} fixture, for CI)
 
 Pure stdlib except optional openai client (urllib fallback included).
 """

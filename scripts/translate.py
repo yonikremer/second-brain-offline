@@ -10,8 +10,30 @@
 - Content-addressed store data/translations/<sha>/translation.md + ledger.jsonl.
 - Bounded retries (max 3).
 
-Config: convert_config.json translation block + TRANSLATE_* / QMD_OPENAI_* env.
-Fail-fast if base_url missing. --mock for CI.
+Config: convert_config.json translation block:
+  translation {base_url (\"\"), reviewer_base_url (\"\"), api_key_env (TRANSLATE_API_KEY),
+               model (minimax-m2.7), reviewer_model (kimi-k2.7), chunk_chars (6000),
+               review_sample (0.2), glossary_path (data/domain_terms/glossary.csv)}
+  Defaults: base_url \"\", reviewer_base_url \"\", chunk_chars 6000, review_sample 0.2,
+            glossary_path data/domain_terms/glossary.csv, model minimax-m2.7,
+            reviewer_model kimi-k2.7, api_key_env TRANSLATE_API_KEY.
+  Env precedence: TRANSLATE_BASE_URL primary, QMD_OPENAI_BASE_URL fallback;
+  reviewer uses TRANSLATE_REVIEWER_BASE_URL override (see translation_reviewer.py).
+Fail-fast if base_url missing. --mock for CI (mock is PERSON-sentinel aware: splits by
+  ⟦PERSON_n⟧, only wraps remaining [א-ת]{2,} as ⟦he:…⟧ so sentinels are not marked).
+
+CLI:
+  python scripts/translate.py [vault_root] [--input DIR] [--glossary PATH] [--out DIR]
+                              [--check] [--mock] [--force] [--resume] [--limit N]
+  vault_root positional (default ".")
+  --input DIR     corpus dir (default raw_md/raw auto-detect)
+  --glossary PATH glossary.csv override (default translation.glossary_path or vault/data/domain_terms/glossary.csv)
+  --out DIR       output store dir (default vault/data/translations, canonical ledger vault/data/translations/ledger.jsonl)
+  --check         only check glossary gate, exit 1 if blocked
+  --mock          offline mock (glossary substitution + sentinel-aware Hebrew marking)
+  --force         retranslate even if cached (content-addressed <sha> already exists)
+  --resume        same as default (resume by hash, kept for docs compat)
+  --limit N       limit files (0=all)
 """
 from __future__ import annotations
 

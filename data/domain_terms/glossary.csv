@@ -1,0 +1,5 @@
+# Example row — replace with real glossary after: python scripts/extract_domain_terms.py . && python scripts/glossary_translate.py . --mock
+# Status enum: approved | proposed | keep_source (pending is review-queue-only, blocked by check_glossary.py)
+# Edit in Excel/Sheets: set status to approved when verified.
+term_he,english,keep_source,notes,status,example_doc
+שלום,hello,0,example: common greeting,proposed,raw_md/example.md

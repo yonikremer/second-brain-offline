@@ -41,9 +41,14 @@ nav:
       - Client ingest pipeline: superpowers/specs/2026-08-02-client-ingest-pipeline-design.md
       - Stage-4 filtering: superpowers/specs/2026-08-02-stage4-filtering-design.md
       - Stage-5 translation: superpowers/specs/2026-08-03-stage5-translation-design.md
+      - Stage-5 addendum (reality): superpowers/specs/stage5-translation-spec-addendum.md
   - Implementation plans:
       - Vault improvements & eval: superpowers/plans/2026-06-11-vault-improvements-and-eval.md
       - Vault skill suite: superpowers/plans/2026-06-15-vault-skill-suite.md
       - qmd OpenAI backend: superpowers/plans/2026-07-09-qmd-openai-backend.md
       - Framework package: superpowers/plans/2026-07-12-vault-framework-package.md
       - Local qmd state: superpowers/plans/2026-07-13-vault-local-qmd-state.md
+      - Document conversion pipeline: superpowers/plans/document_conversion_pipeline.md
+      - Domain term extraction: superpowers/plans/domain-term-extraction.md
+      - Hebrew translation pipeline: superpowers/plans/hebrew-translation-pipeline.md
+      - Human review queue: human-review-queue.md

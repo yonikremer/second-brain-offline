@@ -4,7 +4,20 @@
 CSV path: data/review_queue/review_queue.csv
 Markdown packets under data/review_queue/<batch>.md are rendered views, not parsed back.
 
-Commands: list, gen-packets, parse, clean
+Schema:
+  FIELDNAMES = [term_he, english, keep_source, notes, status, example_doc,
+                context_snippets, occurrences, blocked_docs, question_id]
+  VALID_STATUSES = {approved, proposed, keep_source, pending}
+
+Commands:
+  list       csv                              # list pending rows
+  gen-packets csv [--out-dir DIR] [--batch N] # render batch-*.md packets (default batch 20, ordered by blocked_docs desc)
+  parse      csv [--ledger PATH] [--dry-run]  # validate edited CSV, append approved/keep_source to ledger
+  clean      csv                              # report if queue is clean (all approved)
+
+Ledger (canonical): vault/data/translations/ledger.jsonl
+  --dry-run validates without writing ledger.
+  --ledger overrides canonical path; default derives from csv parents.
 """
 from __future__ import annotations
 

@@ -2,10 +2,27 @@
 """Sampled reviewer: glossary consistency + AskQE + structure spot-check.
 
 Uses Kimi K2.7 (limited budget) at ~10-20% sampling. Flags, not auto-rejections.
-Output: data/translations/review_report.json + per-flag cards.
+Output: data/translations/review_report.json + per-flag cards under review_cards/.
+
+CLI:
+  python scripts/translation_reviewer.py [store_dir] [--vault-root PATH] [--glossary PATH] [--sample 0.2] [--seed 0] [--mock] [--out PATH]
+  store_dir positional (default data/translations)
+  --vault-root PATH   vault root (for convert_config.json + glossary resolution)
+  --glossary PATH     glossary.csv override (default vault/data/domain_terms/glossary.csv)
+  --sample 0.2        sampling rate 0..1 (fractions via random.sample)
+  --seed 0            random seed for deterministic sampling
+  --mock              offline mock (no LLM, only glossary + structure sweep)
+  --out PATH          review_report.json path (default store_dir/review_report.json)
+
+Config: convert_config.json translation.reviewer_model + TRANSLATE_REVIEWER_* / QMD_OPENAI_*.
+Base URL inheritance (highest precedence first):
+  TRANSLATE_REVIEWER_BASE_URL → TRANSLATE_BASE_URL → QMD_OPENAI_BASE_URL → translation.reviewer_base_url → translation.base_url
+Glossary consistency is marker-only: flags unresolved ⟦he:term⟧ for approved terms
+  appearing in >=2 docs; divergent-English detection TODO (requires per-occurrence variant comparison).
+Sampling is random.seed(seed) + random.sample deterministic.
+AskQE prompt shape: "generate 2 factual questions that translation should answer, {questions:[{q,a,answerable}]}"; unanswerable flags dropped content.
 
 --mock for CI (no LLM).
-Config: convert_config.json translation.reviewer_model + TRANSLATE_REVIEWER_* / QMD_OPENAI_*.
 """
 from __future__ import annotations
 

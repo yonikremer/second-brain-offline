@@ -3,8 +3,23 @@
 
 Checks (scripted, no LLM judge):
   residual_hebrew_ratio, untranslated_block, glossary_retention,
-  glossary_consistency, heading_fidelity, structure_fidelity,
-  numeric_fidelity, length_ratio, markup_integrity, marker_count.
+  heading_fidelity, structure_fidelity, numeric_fidelity,
+  length_ratio, markup_integrity, marker_count
+  (glossary_consistency lives in reviewer via marker-only sweep, not here)
+
+Thresholds (pre-calibration placeholders, fit from Phase-0 references):
+  residual_hebrew_ratio threshold 0.02 (person-name allowlist suppressed)
+  length_ratio band [0.5, 2.5] — to be fitted from 3-5 approved reference translations
+
+CLI:
+  python scripts/translation_qa.py <store_dir> [--glossary PATH] [--vault-root PATH] [--json-out PATH]
+  store_dir positional: data/translations root (content-addressed <sha>/translation.md)
+  --glossary PATH       glossary.csv (optional, enables glossary_retention)
+  --vault-root PATH     vault root for locating source docs and person_names allowlist
+  --json-out PATH       write aggregated JSON array [{file, meta, checks}] per doc
+
+Usage example:
+  python scripts/translation_qa.py data/translations --glossary data/domain_terms/glossary.csv --json-out qa.json
 
 Reads content-addressed store data/translations/<sha>/translation.md.
 """

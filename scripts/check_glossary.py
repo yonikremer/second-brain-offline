@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """Gate: fail if glossary.csv is missing or has unapproved rows.
 
+Usage:
+  python scripts/check_glossary.py data/domain_terms/glossary.csv
+  python scripts/check_glossary.py any/path/to/glossary.csv  # reads any CSV path
+
+Exit codes: 0 OK (all rows approved), 1 blocked (missing / empty / invalid).
+
 CSV columns: term_he,english,keep_source,notes,status,example_doc
-Status enum: approved | proposed | keep_source
+Required columns: term_he, status (others optional).
+Status enum: approved | proposed | keep_source | pending — pending is treated as
+  unapproved (blocked) alongside proposed/keep_source; only approved passes.
+# comments and empty lines are stripped before parsing (DictReader).
+Required columns validated: term_he, status; invalid status values are errors.
 Used by translate.py --check and CI.
 """
 from __future__ import annotations
