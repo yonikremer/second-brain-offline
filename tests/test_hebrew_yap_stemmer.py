@@ -17,20 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-SKIP_YAP = not (ROOT / "deps" / "yap" / "yap.exe").exists()
-SKIP_REASON = "deps/yap/yap.exe missing (YAP binary not installed — expected on air-gap CI)"
-
-# Gate the whole file when YAP is absent — individual tests that exercise the binary
-# are skipped; import-only checks would still pass but we skip uniformly.
-if SKIP_YAP:
-    import unittest as _ut
-    # Let import succeed; every test class below will be skipped via decorator.
-    pass
 
 from hebrew_yap_stemmer import analyze_tokens, get_lemmas, root_keys as _yap_root_keys
 
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestAnalyzeTokens(unittest.TestCase):
     """Basic lemma extraction from YAP."""
 
@@ -55,7 +45,6 @@ class TestAnalyzeTokens(unittest.TestCase):
             self.assertEqual(results[0][0], results[0][1])
 
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestGetLemmas(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(get_lemmas([]), set())
@@ -71,7 +60,6 @@ class TestGetLemmas(unittest.TestCase):
 # Root-key grouping — what YAP actually achieves
 # ────────────────────────────────────────────────────────────────────
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestRootKeysRealistic(unittest.TestCase):
     """Root-grouping tests tuned to YAP's actual behavior.
 
@@ -129,7 +117,6 @@ class TestRootKeysRealistic(unittest.TestCase):
 # Unrelated roots must NOT merge
 # ────────────────────────────────────────────────────────────────────
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestRootSeparation(unittest.TestCase):
     def test_two_unrelated_roots(self):
         words = ["שמירה", "כתיבה"]
@@ -146,7 +133,6 @@ class TestRootSeparation(unittest.TestCase):
 # Integration: _filter_hebrew in hot_words uses YAP correctly
 # ────────────────────────────────────────────────────────────────────
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestFilterHebrewIntegration(unittest.TestCase):
     def setUp(self):
         from hot_words import _filter_hebrew, _HB_STOP_WORDS
@@ -182,7 +168,6 @@ class TestFilterHebrewIntegration(unittest.TestCase):
 # Side-by-side: YAP vs old rules — proving YAP is strictly better
 # ────────────────────────────────────────────────────────────────────
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestOldVsNewImprovement(unittest.TestCase):
     """Prove YAP pipeline is better than pure rule-based stemming.
 
@@ -299,7 +284,6 @@ class TestOldVsNewImprovement(unittest.TestCase):
 # Edge cases
 # ────────────────────────────────────────────────────────────────────
 
-@unittest.skipIf(SKIP_YAP, SKIP_REASON)
 class TestEdgeCases(unittest.TestCase):
     def test_empty_input(self):
         self.assertEqual(_yap_root_keys([]), set())
