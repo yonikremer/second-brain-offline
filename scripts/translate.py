@@ -114,6 +114,28 @@ def load_config(vault_root: Path) -> dict:
     return {}
 
 
+def resolve_fix_rounds(cfg: dict, cli_value: int | None) -> int:
+    """Resolve fix_rounds: CLI > env TRANSLATE_FIX_ROUNDS > config > default 3."""
+    if cli_value is not None:
+        try:
+            v = int(cli_value)
+            return max(0, v)
+        except (TypeError, ValueError):
+            pass
+    env = os.environ.get("TRANSLATE_FIX_ROUNDS")
+    if env is not None:
+        try:
+            return max(0, int(env.strip()))
+        except (TypeError, ValueError):
+            pass
+    tcfg = cfg.get("translation", {}) if isinstance(cfg, dict) else {}
+    raw = tcfg.get("fix_rounds", 3)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 3
+
+
 def resolve_corpus_dir(vault_root: Path, explicit: Path | None = None) -> Path:
     if explicit:
         p = Path(explicit)
@@ -763,11 +785,14 @@ def main(argv=None):
     ap.add_argument("--resume", action="store_true", help="same as default (kept for docs compat)")
     ap.add_argument("--no-mask", action="store_true", help="disable md_mask placeholder masking (debug)")
     ap.add_argument("--limit", type=int, default=0, help="limit files (0=all)")
+    ap.add_argument("--fix-rounds", type=int, default=None, help="max LLM fix rounds per doc after QA failures (default 3, 0=disable)")
     args = ap.parse_args(argv)
 
     vault_root = Path(args.vault_root).resolve()
     cfg = load_config(vault_root)
     tcfg = cfg.get("translation", {})
+    fix_rounds = resolve_fix_rounds(cfg, args.fix_rounds)
+    print(f"Fix rounds: {fix_rounds}")
 
     # Glossary gate — path from CLI > convert_config.json translation.glossary_path > default
     if args.glossary:

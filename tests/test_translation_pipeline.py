@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -317,6 +318,52 @@ class TestYamlGuard(unittest.TestCase):
                 cmod.build_frontmatter("Title", datetime.now(timezone.utc), "file.txt", ".txt", False)
         finally:
             cmod.yaml = orig_yaml
+
+
+# ── Fix rounds config ───────────────────────────────────────────────
+
+class TestFixRoundsConfig(unittest.TestCase):
+    def test_fix_rounds_default_is_3(self):
+        self.assertEqual(tmod.resolve_fix_rounds({}, None), 3)
+
+    def test_fix_rounds_from_config(self):
+        self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": 5}}, None), 5)
+
+    def test_fix_rounds_cli_overrides_config(self):
+        self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": 5}}, 1), 1)
+
+    def test_fix_rounds_env_overrides(self):
+        os.environ["TRANSLATE_FIX_ROUNDS"] = "2"
+        try:
+            self.assertEqual(tmod.resolve_fix_rounds({}, None), 2)
+        finally:
+            del os.environ["TRANSLATE_FIX_ROUNDS"]
+
+    def test_fix_rounds_env_overrides_config(self):
+        os.environ["TRANSLATE_FIX_ROUNDS"] = "4"
+        try:
+            # CLI None, env present, config says 5 -> env wins
+            self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": 5}}, None), 4)
+        finally:
+            del os.environ["TRANSLATE_FIX_ROUNDS"]
+
+    def test_fix_rounds_cli_overrides_env(self):
+        os.environ["TRANSLATE_FIX_ROUNDS"] = "4"
+        try:
+            self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": 5}}, 1), 1)
+        finally:
+            del os.environ["TRANSLATE_FIX_ROUNDS"]
+
+    def test_fix_rounds_invalid_falls_back(self):
+        self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": "bad"}}, None), 3)
+        self.assertEqual(tmod.resolve_fix_rounds({}, "not-a-number"), 3)
+
+    def test_fix_rounds_zero_means_no_fix(self):
+        self.assertEqual(tmod.resolve_fix_rounds({}, 0), 0)
+
+    def test_fix_rounds_negative_clamped_to_zero(self):
+        self.assertEqual(tmod.resolve_fix_rounds({"translation": {"fix_rounds": -5}}, None), 0)
+        self.assertEqual(tmod.resolve_fix_rounds({}, -1), 0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 {
-  "_comment": "Translation config (see docs/human-review-queue.md Config & env). Keys: base_url (\"\" primary env TRANSLATE_BASE_URL → fallback QMD_OPENAI_BASE_URL), reviewer_base_url (\"\" → inherits base_url; env TRANSLATE_REVIEWER_BASE_URL overrides), api_key_env (env var name, default TRANSLATE_API_KEY → fallback QMD_OPENAI_API_KEY), model (minimax-m2.7), reviewer_model (kimi-k2.7), chunk_chars (6000 heading→paragraph, qmd-aligned), review_sample (0.2), glossary_path (data/domain_terms/glossary.csv). --mock bypasses base_url.",
+  "_comment": "Translation config (see docs/human-review-queue.md Config & env). Keys: base_url (\"\" primary env TRANSLATE_BASE_URL → fallback QMD_OPENAI_BASE_URL), reviewer_base_url (\"\" → inherits base_url; env TRANSLATE_REVIEWER_BASE_URL overrides), api_key_env (env var name, default TRANSLATE_API_KEY → fallback QMD_OPENAI_API_KEY), model (minimax-m2.7), reviewer_model (kimi-k2.7), chunk_chars (6000 heading→paragraph, qmd-aligned), review_sample (0.2), glossary_path (data/domain_terms/glossary.csv), fix_rounds (3 — max LLM repair rounds per doc after QA failures, 0=disable). --mock bypasses base_url.",
   "docling": {
     "url": "http://localhost:5001",
     "workers": 1,
@@ -22,6 +22,7 @@
     "reviewer_base_url": "",
     "chunk_chars": 6000,
     "review_sample": 0.2,
-    "glossary_path": "data/domain_terms/glossary.csv"
+    "glossary_path": "data/domain_terms/glossary.csv",
+    "fix_rounds": 3
   }
 }
