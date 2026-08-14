@@ -4,7 +4,7 @@
 
 User has a large corpus of Hebrew markdown documents with heavy domain-specific terminology. The goal is a deterministic, offline-capable translation pipeline that: extracts domain terms, bootstraps a glossary, protects domain vocabulary and person names during translation, and gates vault entry on expert-approved assets. This repo is a **template** — no domain data is committed; the pipeline ships as framework scripts + specs.
 
-Prior work: `feat/domain-terms-moshe` (PR #4 — 796-line `extract_domain_terms.py` on `main` + 4 fix commits; `feat/domain-term-extraction` variant stacked on pipeline). `feat/document-conversion-pipeline` has raw→raw_md with Hebrew fix + dedup (630-line `convert_to_md.py`) — to be merged in if needed. Stage 5 design at `docs/superpowers/specs/2026-08-03-stage5-translation-design.md` is spec-only. Model reality: MiniMax M2.7 (unlimited, weak in Hebrew, strong in English), **Kimi K2.7** (limited budget), Hebrew-specific open models (not generation). `data/person_names/` holds 592 curated + 107k full first-names and 818 surnames as offline allowlist.
+Prior work: `feat/domain-terms-moshe` (PR #4 — 796-line `extract_domain_terms.py` on `main` + 4 fix commits; `feat/domain-term-extraction` variant stacked on pipeline). `feat/document-conversion-pipeline` has raw→raw_md with Hebrew fix + dedup (630-line `convert_to_md.py`) — to be merged in if needed. Stage 5 design at `docs/superpowers/specs/2026-08-03-stage5-translation-design.md` is spec-only. Model reality: MiniMax M2.7 (unlimited, weak in Hebrew, strong in English), **Kimi K2.7** (limited budget), Hebrew-specific open models (not generation). `data/person_names/` holds 593 curated + 107k full first-names and 818 surnames as offline allowlist.
 
 ---
 
@@ -58,7 +58,7 @@ CSV schema: `term_he,english,keep_source,notes,status,example_doc` — status en
 - **Structural chunking:** at heading boundaries; if section > chunk_chars, at paragraph boundaries. Never mid-sentence/mid-table/mid-code-block/mid-frontmatter. Fixed 4000-char windows explicitly rejected per stage-5 spec; chunking is qmd-heading-aware aligned.
 - **Context header per chunk:** parent doc title, section path, glossary entries whose terms occur in this chunk — word-boundary (`(?<![א-ת])term(?![א-ת])` for Hebrew, token set for mixed), not substring — keeps prompts small. Previous chunk tail as context-only marker, not to be re-emitted.
 - **Person-name guard (people only) — allowlist-based (per user choice):**
-  - Primary: exact-match against `data/person_names/first_names.txt` (592 curated) + `last_names_ranked.txt` (818) — whole-token via `_mask_via_tokens` (Hebrew maqaf `־` aware), not substring. This is the "good compromise" the user chose: cheap, deterministic, offline, no heavy NER model required.
+  - Primary: exact-match against `data/person_names/first_names.txt` (593 curated) + `last_names_ranked.txt` (818) — whole-token via `_mask_via_tokens` (Hebrew maqaf `־` aware), not substring. This is the "good compromise" the user chose: cheap, deterministic, offline, no heavy NER model required.
   - **Codename exclusion (runtime, domain-dictionary-driven):** org codenames that collide with common Hebrew given names (e.g., `ברק`, `דניאל`) have English equivalents and **must be translated, not masked**. The domain-specific dictionary `data/domain_terms/glossary.csv` (generated from the md files via `extract_domain_terms.py` → `glossary_translate.py`) is the source of truth — at translation time `load_person_names()` is called with `exclude={term_he | status in (approved, keep_source)}` so any codename that appears as a glossary term is automatically removed from the PERSON allowlist. No one-time edit of `first_names.txt` is needed; adding a codename to the glossary immediately changes masking behavior. An optional `data/person_names/codenames.txt` (if present) is also read as an extra exclude set for manual overrides, but the primary mechanism is the glossary.
   - Enhancement (optional, if Hebrew NER available in-gap): run DictaBERT/HeBERT `PERSON` tagger as secondary signal; union with allowlist (after codename exclusion). If NER not deployed, allowlist alone is the gate — documented as such.
   - Mechanics: token-boundary scan → mask spans to sentinels `⟦PERSON_0⟧` before LLM call; model instruction says "Do not translate ⟦PERSON_n⟧". Unmask after. Log any masked name not in allowlists → name-candidate queue (feeds back to `data/person_names/` via review packet).
@@ -218,7 +218,7 @@ python scripts/check_glossary.py data/domain_terms/glossary.csv  # exits 1 while
 python scripts/check_glossary.py data/domain_terms/glossary.csv  # exits 0
 
 # 4) Translation (mocked LLM for CI) — positional vault_root, --input names glossary/corpus overrides
-python scripts/translate.py . --mock --glossary data/domain_terms/glossary.csv --out data/translations/  # name-mask test: person names stay Hebrew (allowlist 592+818)
+python scripts/translate.py . --mock --glossary data/domain_terms/glossary.csv --out data/translations/  # name-mask test: person names stay Hebrew (allowlist 593+818)
 python scripts/translation_qa.py data/translations --vault-root . --glossary data/domain_terms/glossary.csv  # seeded-error fixtures: expect catches
 python scripts/translation_qa.py data/translations --json-out qa.json --vault-root .  # aggregated [{file,meta,checks}] per doc
 
@@ -249,7 +249,7 @@ Example vault: `python scripts/convert_to_md.py example_vault` then `python scri
 | MiniMax proposing all glossary rows anchors expert | Expert overwrites freely; show context snippets so correction is faster than de-novo; track edit rate to detect anchoring |
 | MiniMax weak in Hebrew → hallucinates glossary | Hebrew-context snippets bound invention; zero-guessing + markers; sampled Kimi reviewer catches English-side drift |
 | Kimi budget exhaustion mid-campaign | Sampling 10–20% (user chose), fallback reviewer = MiniMax, ledger records which docs got which reviewer |
-| Person-name allowlist misses rare names (592 curated) | 107k full list available for recall mode; NER as optional union; unknown names surface via review queue → one-time add to allowlist |
+| Person-name allowlist misses rare names (593 curated) | 107k full list available for recall mode; NER as optional union; unknown names surface via review queue → one-time add to allowlist |
 | Approved references anchor model choice | Use references only for policy style + QA fitting, never for pairwise model ranking; use blind side-by-side instead |
 | Overwritable outputs | Content-addressed `data/translations/<sha>/` + append-only `ledger.jsonl`; never overwrite |
 | Unbounded retries | Fixed max + quarantine |

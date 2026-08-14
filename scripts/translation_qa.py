@@ -396,8 +396,28 @@ def check_preserved_invariants(source_body: str, trans_body: str, vault_root: Pa
     raw_source = source_body
     try:
         import translate as tmod  # type: ignore
+
         if vault_root is not None:
-            first, last = tmod.load_person_names(vault_root)
+            # Glossary-aware: codenames (domain terms) are excluded from PERSON guard
+            # so a correctly translated codename does not trigger a false missing-person failure.
+            try:
+                import csv as _csv
+
+                glossary_path = vault_root / "data" / "domain_terms" / "glossary.csv"
+                glossary_terms: set[str] = set()
+                if glossary_path.exists():
+                    text = glossary_path.read_text(encoding="utf-8")
+                    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+                    if lines:
+                        reader = _csv.DictReader(lines)
+                        for row in reader:
+                            term = (row.get("term_he") or "").strip()
+                            status = (row.get("status") or "").strip()
+                            if term and status in ("approved", "keep_source"):
+                                glossary_terms.add(term)
+                first, last = tmod.load_person_names(vault_root, exclude=glossary_terms)
+            except Exception:
+                first, last = tmod.load_person_names(vault_root)
         else:
             first, last = set(), set()
         invariants = tmod.extract_preservation_invariants(raw_source, first, last)

@@ -7,7 +7,7 @@
   URLs/file-paths are extracted from the source chunk, passed to the LLM as
   explicit verbatim-context, and verified to appear in the output.
 - Filtered glossary: only terms occurring in chunk are injected.
-- Person-name guard: exact-match against data/person_names/ (592 first + 818 last),
+- Person-name guard: exact-match against data/person_names/ (593 first + 818 last),
   extracted + verified (not masked).
 - Structured output {translation, unknown_terms, notes} via response_format=json_object.
 - Zero-guessing: unknown terms → ⟦he:<term>⟧ markers, blocked_on_term ledger.
@@ -816,14 +816,19 @@ def main(argv=None):
     # Codename-aware person names: exclude org codenames (static file + glossary terms)
     # so that a codename like ברק/דניאל is translated via glossary, not masked as PERSON.
     glossary_terms = {r.get("term_he", "").strip() for r in glossary if (r.get("status") or "").strip() in ("approved", "keep_source") and r.get("term_he", "").strip()}
-    codenames = load_codenames(vault_root)
+    # Load with glossary exclusion (primary); codenames.txt is optional manual override
+    # Keep separate counts for audit (glossary_terms may be hundreds of domain terms,
+    # only those overlapping the allowlist are true codename exclusions).
+    raw_first, raw_last = load_person_names(vault_root)
+    raw_all = raw_first | raw_last
+    codenames_file = load_codenames(vault_root)
+    glossary_overlap = glossary_terms & raw_all
+    codenames_overlap = codenames_file & raw_all
     first_names, last_names = load_person_names(vault_root, exclude=glossary_terms)
-    excluded_from_person = codenames | glossary_terms
-    if excluded_from_person:
-        # Report how many codenames were removed from the allowlist (for audit)
-        # Count before vs after is not kept, so just report the set size
-        print(f"Codenames excluded from PERSON guard: {len(excluded_from_person)} ({', '.join(sorted(list(excluded_from_person))[:5])}{' ...' if len(excluded_from_person) > 5 else ''})")
-    print(f"Person names: {len(first_names)} first, {len(last_names)} last")
+    total_excluded = codenames_overlap | glossary_overlap
+    if total_excluded:
+        print(f"Codenames excluded from PERSON guard: {len(total_excluded)} (file:{len(codenames_overlap)} glossary:{len(glossary_overlap)} — {', '.join(sorted(list(total_excluded))[:5])}{' ...' if len(total_excluded) > 5 else ''})")
+    print(f"Person names: {len(first_names)} first, {len(last_names)} last (raw {len(raw_first)}/{len(raw_last)}, excluded {len(total_excluded)})")
 
     corpus_dir = resolve_corpus_dir(vault_root, Path(args.input_dir) if args.input_dir else None)
     md_files = sorted(corpus_dir.rglob("*.md"))
