@@ -553,6 +553,20 @@ class TestMockFix(unittest.TestCase):
             glossary)
         self.assertIn("table_fidelity", prompt)
 
+    def test_chunked_fix_prompts_for_large_doc(self):
+        large_src = "# H\n\n" + ("word " * 3000)  # ~15k
+        large_trans = "prev " * 3000
+        prompts = tmod._build_chunked_fix_prompts(large_src, large_trans, [{"check": "heading_fidelity", "status": "fail"}], [], None, 6000)
+        self.assertGreater(len(prompts), 1)
+        for p in prompts:
+            self.assertIn("Chunk", p)
+            self.assertIn("heading_fidelity", p)
+
+    def test_small_doc_not_chunked(self):
+        src = "# H\n\nShort body"
+        prompts = tmod._build_chunked_fix_prompts(src, "prev", [{"check": "heading_fidelity", "status": "fail"}], [], None, 6000)
+        self.assertEqual(len(prompts), 1)
+
 
 # ── Fix ledger via main integration smoke ─────────────────────────────
 
