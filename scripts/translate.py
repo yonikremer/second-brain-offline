@@ -58,8 +58,7 @@ PERSON_OPEN = "⟦PERSON_"
 PERSON_CLOSE = "⟧"
 HE_MARKER_FMT = "⟦he:{term}⟧"
 
-# Hebrew char range (narrow א-ת) — used in mock_translate for sentinel-aware marking
-HEBREW_RE = re.compile(r"[א-ת]")
+# Hebrew char range (narrow א-ת) — word runs used for mock/qa sentinel-aware marking
 HEBREW_WORD_RE = re.compile(r"[א-ת]{2,}")
 
 

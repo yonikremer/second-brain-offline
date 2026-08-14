@@ -243,10 +243,6 @@ def check_markup_integrity(body: str) -> dict:
     issues = []
     if fences % 2 != 0:
         issues.append("orphaned code fence (odd count)")
-    # Check unclosed brackets in links (rough)
-    open_b = body.count("[")
-    close_b = body.count("]")
-    # Not strict — just fence integrity for now
     return {
         "check": "markup_integrity",
         "status": "fail" if issues else "pass",
