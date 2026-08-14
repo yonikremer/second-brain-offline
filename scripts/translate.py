@@ -928,11 +928,13 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
     failures = format_qa_failures(checks)
     fix_rounds_used = 0
     all_fix_attempts: list[dict] = []
+    fix_unknown_terms: list[str] = []
     while failures and fix_rounds_used < fix_rounds:
         fix_rounds_used += 1
         if mock:
             fixed = mock_translate(raw_text, glossary_for_chunk(raw_text, glossary), full_invariants)
             new_body = fixed["translation"]
+            fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
         else:
             fix_prompt = build_fix_prompt(raw_text, trans_body, failures,
                                           glossary_rows=glossary_for_chunk(raw_text, glossary),
@@ -940,10 +942,11 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
             try:
                 resp = call_llm(base_url, api_key, model, fix_prompt)
                 new_body = resp.get("translation", "")
+                fix_unknown_terms.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
+                fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
             except Exception as e:
                 all_fix_attempts.append({"round": fix_rounds_used, "error": str(e)[:500], "failures_before": failures})
                 break
-        # Include mock preservation recovery if needed: re-check invariants after mock fix
         trans_body = new_body
         all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures})
         checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
@@ -952,18 +955,15 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
         final_status = "qa_failed"
     else:
         has_markers = "⟦he:" in trans_body
-        # doc_unknown from initial may still be relevant if QA passed but original had blocked terms
-        # Re-derive blocked status from translation markers + unknown_terms style
         final_status = "blocked_on_term" if has_markers else "completed"
-        # If original result was blocked_on_term and QA now passes, preserve blocked
-        if result.get("status") == "blocked_on_term" and final_status == "completed" and result.get("unknown_terms"):
-            # QA glossary_retention may have passed via markers, but still blocked is correct if markers remain
-            # has_markers already captures; if no markers but unknown_terms existed, QA passed means no failure, so completed
-            pass
+    marker_terms = [m[4:-1] for m in re.findall(r"⟦he:[^⟧]+⟧", trans_body)]
+    recomputed_unknown = sorted(set(marker_terms + [str(x).strip() for x in fix_unknown_terms if str(x).strip()]))
+    final_unknown = recomputed_unknown if fix_rounds_used > 0 else result.get("unknown_terms", [])
     result.update({
         "translation": trans_body,
         "status": final_status,
         "marker_count": trans_body.count("⟦he:"),
+        "unknown_terms": sorted(set(final_unknown)),
         "fix_rounds_used": fix_rounds_used,
         "fix_attempts": all_fix_attempts,
         "qa_checks": checks,
@@ -1172,6 +1172,15 @@ def main(argv=None):
         store_dir_pre = out_root / src_hash_pre[:2] / src_hash_pre
         out_file_pre = store_dir_pre / "translation.md"
         if out_file_pre.exists() and not args.force:
+            # Fail-closed: cached qa_failed must still count toward exit 1
+            try:
+                cached_text = out_file_pre.read_text(encoding="utf-8")
+                if '"status": "qa_failed"' in cached_text:
+                    failed_docs.append(rel)
+                    qa_failed += 1
+                    print(f"  {rel}: qa_failed (cached)", file=sys.stderr)
+            except OSError:
+                pass
             continue
 
         # Translate with QA fix loop (handles english-only internally)
@@ -1224,7 +1233,8 @@ def main(argv=None):
         src_hash = result["source_hash"]
         fix_used = result.get("fix_rounds_used", 0)
         qa_failures = result.get("qa_failures", [])
-        qa_checks = result.get("qa_checks", [])
+        # qa_checks retained for debugging but not written to frontmatter (failures are)
+        _qa_checks = result.get("qa_checks", [])
 
         # Write content-addressed store
         store_dir = out_root / src_hash[:2] / src_hash
