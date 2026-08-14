@@ -767,8 +767,8 @@ def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures
     src_chunks = chunk_markdown(source_text, max_chars=chunk_chars)
     prev_chunks = chunk_markdown(prev_translation, max_chars=chunk_chars) if prev_translation.strip() else []
     n = max(len(src_chunks), len(prev_chunks), 1)
-    fn = first_names or set()
-    ln = last_names or set()
+    fn = first_names if first_names is not None else set()
+    ln = last_names if last_names is not None else set()
     prompts: list[str] = []
     for i in range(n):
         src = src_chunks[i]["chunk_text"] if i < len(src_chunks) else ""
@@ -777,19 +777,17 @@ def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures
         # Per-chunk filtering: only inject glossary terms that occur in this chunk
         if src and glossary_rows:
             cg = glossary_for_chunk(src, glossary_rows)
-            chunk_glossary: list[dict] | None = cg  # may be [] — keep empty to avoid whole-doc fallback
+            chunk_glossary: list[dict] | None = cg  # [] means no terms in this chunk — keep empty
         elif src:
             chunk_glossary = None
         else:
             chunk_glossary = glossary_rows
         # Chunk-specific invariants with real person-name allowlist
         chunk_invariants = extract_preservation_invariants(src, fn, ln) if src else None
-        if chunk_invariants is not None:
-            # Empty invariants dict is fine — pass as-is so model isn't flooded with global invariants
-            pass
-        else:
+        if chunk_invariants is None:
             chunk_invariants = invariants
-            chunk_glossary = chunk_glossary if chunk_glossary is not None else glossary_rows
+            if chunk_glossary is None:
+                chunk_glossary = glossary_rows
         p = build_fix_prompt(src, prev, failures, chunk_glossary, chunk_invariants)
         # Annotate that failures are global — model should only fix those affecting its chunk
         global_note = "Note: QA failures above are global for the whole document — fix only those that affect your chunk's section, keep rest identical.\n\n"
@@ -1046,7 +1044,13 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
         final_status = "blocked_on_term" if has_markers else "completed"
     marker_terms = [m[4:-1] for m in re.findall(r"⟦he:[^⟧]+⟧", trans_body)]
     recomputed_unknown = sorted(set(marker_terms + [str(x).strip() for x in fix_unknown_terms if str(x).strip()]))
-    final_unknown = recomputed_unknown if fix_rounds_used > 0 else result.get("unknown_terms", [])
+    # When fix was attempted, merge original unknown_terms (preservation failures) with recomputed
+    # so blocked docs aren't hidden if fix resolves QA but leaves invariant gaps
+    if fix_rounds_used > 0:
+        orig = result.get("unknown_terms", [])
+        final_unknown = sorted(set(orig) | set(recomputed_unknown))
+    else:
+        final_unknown = result.get("unknown_terms", [])
     result.update({
         "translation": trans_body,
         "status": final_status,
@@ -1230,8 +1234,8 @@ def main(argv=None):
     ledger_path = get_ledger_path(vault_root, out_root)
     try:
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"warn: cannot create ledger dir {ledger_path.parent}: {e}", file=sys.stderr)
     glossary_version = ""
     if glossary_path.exists():
         try:
@@ -1275,18 +1279,18 @@ def main(argv=None):
                         try:
                             fm = json.loads(cached_text[4:end].strip())
                             is_qa_failed = fm.get("status") == "qa_failed"
-                        except Exception:
-                            is_qa_failed = '"status": "qa_failed"' in cached_text
+                        except (json.JSONDecodeError, ValueError):
+                            is_qa_failed = bool(re.search(r'"status"\s*:\s*"qa_failed"', cached_text))
                     else:
-                        is_qa_failed = '"status": "qa_failed"' in cached_text
+                        is_qa_failed = bool(re.search(r'"status"\s*:\s*"qa_failed"', cached_text))
                 else:
-                    is_qa_failed = '"status": "qa_failed"' in cached_text
+                    is_qa_failed = bool(re.search(r'"status"\s*:\s*"qa_failed"', cached_text))
                 if is_qa_failed:
                     failed_docs.append(rel)
                     qa_failed += 1
                     print(f"  {rel}: qa_failed (cached)", file=sys.stderr)
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"warn: cannot read cached {out_file_pre}: {e}", file=sys.stderr)
             continue
 
         # Translate with QA fix loop (handles english-only internally)
@@ -1375,6 +1379,12 @@ def main(argv=None):
             }
             if "error" in attempt:
                 evt["error"] = attempt["error"]
+            for k in ("chunked", "src_len", "trans_len", "chunks"):
+                if k in attempt:
+                    evt[k] = attempt[k]
+            # Ensure chunked is always present for schema consistency
+            if "chunked" not in evt:
+                evt["chunked"] = False
             with open(ledger_path, "a", encoding="utf-8") as lf:
                 lf.write(json.dumps(evt, ensure_ascii=False) + "\n")
 

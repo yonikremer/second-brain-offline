@@ -615,6 +615,12 @@ class TestFixLedger(unittest.TestCase):
             events = [json.loads(l) for l in lines]
             self.assertTrue(any(e.get("event") == "fix_attempt" for e in events), f"no fix_attempt in {events}")
             self.assertTrue(any(e.get("event") == "qa_result" for e in events))
+            # Ledger schema normalized: chunked/src_len/trans_len should be present
+            for e in events:
+                if e.get("event") == "fix_attempt":
+                    self.assertIn("chunked", e)
+                    self.assertIn("src_len", e)
+                    self.assertIn("trans_len", e)
 
     def test_cache_fail_closed_counts_qa_failed(self):
         import unittest.mock as mock
