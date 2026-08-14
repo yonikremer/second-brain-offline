@@ -761,21 +761,39 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
 
 def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures: list[dict],
                                glossary_rows: list[dict] | None, invariants: dict | None,
-                               chunk_chars: int) -> list[str]:
+                               chunk_chars: int,
+                               first_names: set[str] | None = None, last_names: set[str] | None = None) -> list[str]:
     """Split large-doc fix into per-chunk prompts to avoid 12k truncation loss."""
     src_chunks = chunk_markdown(source_text, max_chars=chunk_chars)
     prev_chunks = chunk_markdown(prev_translation, max_chars=chunk_chars) if prev_translation.strip() else []
     n = max(len(src_chunks), len(prev_chunks), 1)
+    fn = first_names or set()
+    ln = last_names or set()
     prompts: list[str] = []
     for i in range(n):
         src = src_chunks[i]["chunk_text"] if i < len(src_chunks) else ""
         prev = prev_chunks[i]["chunk_text"] if i < len(prev_chunks) else ""
         section = src_chunks[i].get("section_path", "") if i < len(src_chunks) else f"chunk {i+1}/{n}"
-        chunk_glossary = glossary_for_chunk(src, glossary_rows) if glossary_rows and src else (glossary_rows or [])
-        # Use chunk-specific invariants to keep prompt focused
-        chunk_invariants = extract_preservation_invariants(src, set(), set()) if src else None
-        p = build_fix_prompt(src, prev, failures, chunk_glossary or glossary_rows, chunk_invariants or invariants)
-        p = f"Chunk {i+1}/{n} — Section: {section}\n\n" + p
+        # Per-chunk filtering: only inject glossary terms that occur in this chunk
+        if src and glossary_rows:
+            cg = glossary_for_chunk(src, glossary_rows)
+            chunk_glossary: list[dict] | None = cg  # may be [] — keep empty to avoid whole-doc fallback
+        elif src:
+            chunk_glossary = None
+        else:
+            chunk_glossary = glossary_rows
+        # Chunk-specific invariants with real person-name allowlist
+        chunk_invariants = extract_preservation_invariants(src, fn, ln) if src else None
+        if chunk_invariants is not None:
+            # Empty invariants dict is fine — pass as-is so model isn't flooded with global invariants
+            pass
+        else:
+            chunk_invariants = invariants
+            chunk_glossary = chunk_glossary if chunk_glossary is not None else glossary_rows
+        p = build_fix_prompt(src, prev, failures, chunk_glossary, chunk_invariants)
+        # Annotate that failures are global — model should only fix those affecting its chunk
+        global_note = "Note: QA failures above are global for the whole document — fix only those that affect your chunk's section, keep rest identical.\n\n"
+        p = f"Chunk {i+1}/{n} — Section: {section}\n{global_note}" + p
         prompts.append(p)
     return prompts
 
@@ -968,11 +986,13 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
             fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
         else:
             # For large docs, avoid silent 12k truncation by chunking the fix
-            is_large = len(raw_text) > 12000 or len(trans_body) > 12000
+            threshold = max(12000, chunk_chars * 2)
+            is_large = len(raw_text) > threshold or len(trans_body) > threshold
             if is_large:
                 prompts = _build_chunked_fix_prompts(raw_text, trans_body, failures,
                                                      glossary_for_chunk(raw_text, glossary),
-                                                     full_invariants, chunk_chars)
+                                                     full_invariants, chunk_chars,
+                                                     first_names, last_names)
                 # Log truncation avoidance
                 print(f"  fix round {fix_rounds_used}: large doc ({len(raw_text)} src, {len(trans_body)} trans) — chunked into {len(prompts)} prompts", file=sys.stderr)
                 chunk_translations: list[str] = []
@@ -983,7 +1003,6 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
                     try:
                         resp = call_llm(base_url, api_key, model, p)
                         ct = resp.get("translation", "")
-                        # If single-chunk response contains our chunk header, strip it
                         chunk_translations.append(ct)
                         chunk_unknown.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
                         chunk_unknown.extend(re.findall(r"⟦he:[^⟧]+⟧", ct))
@@ -1000,6 +1019,7 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
                 # Record that this round was chunked
                 all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures, "chunked": True, "chunks": len(prompts), "src_len": len(raw_text), "trans_len": len(trans_body)})
                 trans_body = new_body
+                # Normalize ledger schema: also include chunked flag for non-chunked? handled below
                 checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
                 failures = format_qa_failures(checks)
                 continue
@@ -1013,10 +1033,10 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
                 fix_unknown_terms.extend([str(x).strip() for x in resp.get("unknown_terms", []) if str(x).strip()])
                 fix_unknown_terms.extend(re.findall(r"⟦he:[^⟧]+⟧", new_body))
             except Exception as e:
-                all_fix_attempts.append({"round": fix_rounds_used, "error": str(e)[:500], "failures_before": failures})
+                all_fix_attempts.append({"round": fix_rounds_used, "error": str(e)[:500], "failures_before": failures, "chunked": False, "src_len": len(raw_text), "trans_len": len(trans_body)})
                 break
         trans_body = new_body
-        all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures})
+        all_fix_attempts.append({"round": fix_rounds_used, "failures_before": failures, "chunked": False, "src_len": len(raw_text), "trans_len": len(trans_body)})
         checks = run_qa_for_doc(source_path, trans_body, meta_stub, glossary, vault_root)
         failures = format_qa_failures(checks)
     if failures:
@@ -1208,6 +1228,10 @@ def main(argv=None):
 
     # Ledger (canonical: vault_root/data/translations/ledger.jsonl)
     ledger_path = get_ledger_path(vault_root, out_root)
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     glossary_version = ""
     if glossary_path.exists():
         try:
@@ -1243,7 +1267,21 @@ def main(argv=None):
             # Fail-closed: cached qa_failed must still count toward exit 1
             try:
                 cached_text = out_file_pre.read_text(encoding="utf-8")
-                if '"status": "qa_failed"' in cached_text:
+                is_qa_failed = False
+                # Robust frontmatter parse (not substring) — extract JSON between --- markers
+                if cached_text.startswith("---\n"):
+                    end = cached_text.find("\n---\n", 4)
+                    if end != -1:
+                        try:
+                            fm = json.loads(cached_text[4:end].strip())
+                            is_qa_failed = fm.get("status") == "qa_failed"
+                        except Exception:
+                            is_qa_failed = '"status": "qa_failed"' in cached_text
+                    else:
+                        is_qa_failed = '"status": "qa_failed"' in cached_text
+                else:
+                    is_qa_failed = '"status": "qa_failed"' in cached_text
+                if is_qa_failed:
                     failed_docs.append(rel)
                     qa_failed += 1
                     print(f"  {rel}: qa_failed (cached)", file=sys.stderr)

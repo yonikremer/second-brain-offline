@@ -568,18 +568,90 @@ class TestMockFix(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
 
 
-# ── Fix ledger via main integration smoke ─────────────────────────────
+# ── Fix ledger and cache fail-closed integration ────────────────────
 
 class TestFixLedger(unittest.TestCase):
-    def test_ledger_contains_fix_attempts_via_main(self):
-        import subprocess, json, sys as _sys
+    def test_main_writes_fix_attempt_and_qa_result_ledger(self):
+        import unittest.mock as mock
         with tempfile.TemporaryDirectory() as td:
             vault = Path(td)
             raw = vault / "raw_md"
             raw.mkdir(parents=True)
-            # Use a doc that mock will translate but QA mock will fail once then pass
-            # Instead test the helper's fix_attempts directly, and verify main writes ledger by running main with mocked QA
-            pass  # covered by TestFixRoundsLoop; ledger write tested in integration below
+            src = "# H\n\nBody מודל\n"
+            (raw / "doc.md").write_text(src, encoding="utf-8")
+            (vault / "data" / "domain_terms").mkdir(parents=True)
+            (vault / "data" / "domain_terms" / "glossary.csv").write_text(
+                "term_he,english,keep_source,notes,status,example_doc\nמודל,model,0,,approved,doc.md\n", encoding="utf-8")
+            (vault / "convert_config.json").write_text(json.dumps({"translation": {"base_url": "http://fake", "fix_rounds": 2}}), encoding="utf-8")
+            out = vault / "data" / "translations"
+            # Mock QA: first fail, then pass; mock LLM respects segments
+            def fake_llm(base_url, api_key, model, prompt, retries=3):
+                if "⟦SEG⟧" in prompt:
+                    segs = prompt.count("⟦SEG⟧") + 1
+                    # Always return model-containing translation for fix
+                    return {"translation": "⟦SEG⟧".join(["Body model"] * segs), "unknown_terms": [], "notes": []}
+                # initial translation: bad without model
+                if "Body model" not in prompt and "QA failures" not in prompt:
+                    return {"translation": "Bad", "unknown_terms": [], "notes": []}
+                return {"translation": "Body model", "unknown_terms": [], "notes": []}
+            # Need to control QA: initial call fails, fix call passes
+            qa_calls = []
+            orig_qa = tmod.run_qa_for_doc
+            def fake_qa(source_path, trans_body, trans_meta, glossary, vault_root):
+                qa_calls.append(trans_body)
+                if len(qa_calls) == 1:
+                    return [{"check": "glossary_retention", "status": "fail", "violations": ["מודל"]}]
+                return []
+            with mock.patch.object(tmod, "call_llm", side_effect=fake_llm):
+                with mock.patch.object(tmod, "run_qa_for_doc", side_effect=fake_qa):
+                    # Call main directly
+                    tmod.main([str(vault), "--out", str(out), "--fix-rounds", "2"])
+            ledger = out / "ledger.jsonl"
+            # If out is inside vault, canonical ledger is vault/data/translations/ledger.jsonl
+            canonical = vault / "data" / "translations" / "ledger.jsonl"
+            ledger_path = canonical if canonical.exists() else ledger
+            self.assertTrue(ledger_path.exists(), f"ledger not found {ledger_path}")
+            lines = ledger_path.read_text(encoding="utf-8").strip().splitlines()
+            events = [json.loads(l) for l in lines]
+            self.assertTrue(any(e.get("event") == "fix_attempt" for e in events), f"no fix_attempt in {events}")
+            self.assertTrue(any(e.get("event") == "qa_result" for e in events))
+
+    def test_cache_fail_closed_counts_qa_failed(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            raw = vault / "raw_md"
+            raw.mkdir(parents=True)
+            src = "# H\n\nBody מודל\n"
+            (raw / "doc.md").write_text(src, encoding="utf-8")
+            (vault / "data" / "domain_terms").mkdir(parents=True)
+            (vault / "data" / "domain_terms" / "glossary.csv").write_text(
+                "term_he,english,keep_source,notes,status,example_doc\nמודל,model,0,,approved,doc.md\n", encoding="utf-8")
+            (vault / "convert_config.json").write_text(json.dumps({"translation": {"base_url": "http://fake"}}), encoding="utf-8")
+            out = Path(td) / "out"
+            # First run: force qa_failed via mocked QA always failing
+            def bad_llm(base_url, api_key, model, prompt, retries=3):
+                if "⟦SEG⟧" in prompt:
+                    segs = prompt.count("⟦SEG⟧") + 1
+                    return {"translation": "⟦SEG⟧".join(["Bad"] * segs), "unknown_terms": [], "notes": []}
+                return {"translation": "Bad", "unknown_terms": [], "notes": []}
+            with mock.patch.object(tmod, "call_llm", side_effect=bad_llm):
+                with mock.patch.object(tmod, "run_qa_for_doc", return_value=[{"check": "glossary_retention", "status": "fail", "violations": ["x"]}]):
+                    try:
+                        tmod.main([str(vault), "--out", str(out), "--fix-rounds", "1"])
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 1)
+                    else:
+                        self.fail("expected SystemExit 1 for qa_failed")
+            # Second run without --force should still exit 1 via cached qa_failed
+            with mock.patch.object(tmod, "call_llm", side_effect=bad_llm):
+                with mock.patch.object(tmod, "run_qa_for_doc", return_value=[{"check": "glossary_retention", "status": "fail", "violations": ["x"]}]):
+                    try:
+                        tmod.main([str(vault), "--out", str(out), "--fix-rounds", "1"])
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 1)
+                    else:
+                        self.fail("expected cached qa_failed exit 1")
 
 
 if __name__ == "__main__":

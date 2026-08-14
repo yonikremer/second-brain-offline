@@ -90,13 +90,9 @@ CSV schema: `term_he,english,keep_source,notes,status,example_doc` — status en
 - **CLI:** `python scripts/translation_qa.py <store_dir> [--glossary PATH] [--vault-root PATH] [--json-out PATH]` — vault-root aware for source resolution; `--json-out` writes aggregated `[{file,meta,checks}]` JSON.
 - Any failure → quarantine → review queue. Batch report: pass rates, marker counts, glossary growth, blocked counts.
 
-### 3c) Self-heal fix loop (QA → LLM repair)
+### 3c) Self-heal fix loop (QA -> LLM repair)
 
-Integrated into `scripts/translate.py` after each doc`s `(full_translation = "
-
-".join(chunk_translations))` assembly: run `translation_qa.run_all(source_path, trans_body, meta, glossary, vault_root)`, filter `status==fail`, build repair prompt via `build_fix_prompt(source, prev, failures, glossary_slice, invariants)` and re-call `call_llm`. Loop up to `fix_rounds` (default 3). For large docs (>12k src or trans) the fix is chunked via `_build_chunked_fix_prompts` (re-uses `chunk_markdown` boundaries, per-chunk glossary/invariants slice, one LLM call per chunk, then `
-
-`.join) to avoid silent truncation — small docs use single whole-doc prompt. Each attempt logs `fix_attempt` (round, failures_before, chunked flag, src_len/trans_len) + `qa_result`; exhaustion writes `qa_failed` quarantine artifact (`fix_rounds_used`, `qa_failures[:5]`) and `sys.exit(1)` (fail-closed, stops token waste). Cached `qa_failed` artifacts also count toward exit 1 until `--force`. Mock path preserves invariants via `mock_translate`.
+Integrated into `scripts/translate.py` after each doc assembly (`full_translation = "\n\n".join(chunk_translations)`): run `translation_qa.run_all(source_path, trans_body, meta, glossary, vault_root)`, filter `status==fail`, build repair prompt via `build_fix_prompt` and re-call `call_llm`. Loop up to `fix_rounds` (default 3, config `translation.fix_rounds` / env `TRANSLATE_FIX_ROUNDS` / CLI `--fix-rounds`). For large docs (>12k src or trans) the fix is chunked via `_build_chunked_fix_prompts` (re-uses `chunk_markdown` boundaries, per-chunk glossary/invariants slice, one LLM call per chunk, then `"\n\n".join`) to avoid silent truncation — small docs use single whole-doc prompt. Each attempt logs `fix_attempt` (round, failures_before, chunked flag, src_len/trans_len) + `qa_result`; exhaustion writes `qa_failed` quarantine artifact (`fix_rounds_used`, `qa_failures[:5]`) and `sys.exit(1)` (fail-closed, stops token waste). Cached `qa_failed` artifacts also count toward exit 1 until `--force`. Mock path preserves invariants via `mock_translate`.
 
 ### 3d) Prompt / translation instruction
 
