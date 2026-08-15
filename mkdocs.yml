@@ -42,6 +42,7 @@ nav:
       - Stage-4 filtering: superpowers/specs/2026-08-02-stage4-filtering-design.md
       - Stage-5 translation: superpowers/specs/2026-08-03-stage5-translation-design.md
       - Stage-5 addendum (reality): superpowers/specs/stage5-translation-spec-addendum.md
+      - Conversion defect census & router: superpowers/specs/2026-08-09-conversion-defect-census-and-router-design.md
   - Implementation plans:
       - Vault improvements & eval: superpowers/plans/2026-06-11-vault-improvements-and-eval.md
       - Vault skill suite: superpowers/plans/2026-06-15-vault-skill-suite.md
@@ -52,3 +53,4 @@ nav:
       - Domain term extraction: superpowers/plans/domain-term-extraction.md
       - Hebrew translation pipeline: superpowers/plans/hebrew-translation-pipeline.md
       - Human review queue: human-review-queue.md
+      - Conversion defect census: superpowers/plans/2026-08-09-conversion-defect-census.md
