@@ -148,7 +148,6 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
     if vault_root is not None:
         candidates.append(vault_root / "data" / "person_names" / "first_names.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names_ranked.txt")
-        candidates.append(vault_root / "data" / "person_names" / "last_names.txt")
         codename_candidates.append(vault_root / "data" / "person_names" / "codenames.txt")
         glossary_candidates.append(vault_root / "data" / "domain_terms" / "glossary.csv")
     else:

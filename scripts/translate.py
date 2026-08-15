@@ -191,8 +191,6 @@ def load_codenames(vault_root: Path) -> set[str]:
 def load_person_names(vault_root: Path, exclude: set[str] | None = None) -> tuple[set[str], set[str]]:
     first_p = vault_root / "data" / "person_names" / "first_names.txt"
     last_p = vault_root / "data" / "person_names" / "last_names_ranked.txt"
-    if not last_p.exists():
-        last_p = vault_root / "data" / "person_names" / "last_names.txt"
     first: set[str] = set()
     last: set[str] = set()
     for p, s in [(first_p, first), (last_p, last)]:
