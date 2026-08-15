@@ -441,9 +441,16 @@ def check_preserved_invariants(source_body: str, trans_body: str, vault_root: Pa
         order_bad = tmod.verify_all_ordered(invariants, trans_body)
         global_bad = tmod.verify_global_order(raw_source, invariants, trans_body)
     except Exception:
-        # Fallback: lightweight regex extraction if translate import fails
-        en_spans = re.findall(r"[A-Za-z]{2,}(?:[ \t]*[A-Za-z0-9\-'\".,;:()&`]+)*", raw_source)
-        en_spans = [s.strip() for s in en_spans if len(s.strip()) >= 2 and len(re.findall(r"[A-Za-z]", s)) >= 2]
+        # Fallback: lightweight technical-span extraction if translate import fails
+        _tech_re = re.compile(
+            r"\b(?:[A-Z]{2,}(?:\s+[A-Z][a-z]+){0,2}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}"
+            r"|[A-Za-z]+[-_/][A-Za-z0-9\-_./]+|[A-Z][a-z]*[A-Z][a-zA-Z]*"
+            r"|[A-Za-z]+[0-9][A-Za-z0-9]*|[A-Z][a-z]{2,})\b"
+        )
+        _common = {"The","This","That","And","Or","But","With","From","For","To","Of","In","On","At","By","A","An","Is","Are","It","As"}
+        en_spans = [s.strip().strip(".,;:\"'()") for s in _tech_re.findall(raw_source)]
+        en_spans = [s for s in en_spans if len(s) >= 2 and len(re.findall(r"[A-Za-z]", s)) >= 2 and s not in _common]
+        en_spans = list(dict.fromkeys(en_spans))
         url_spans = re.findall(r"https?://[^\s<>\[\]()\"']+|www\.[^\s<>\[\]()\"']+", raw_source)
         missing = {}
         for cat, items in [("english_spans", list(dict.fromkeys(en_spans))), ("urls_and_paths", list(dict.fromkeys(url_spans)))]:

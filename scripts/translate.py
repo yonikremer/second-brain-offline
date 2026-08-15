@@ -83,14 +83,39 @@ HEBREW_WORD_RE = re.compile(r"[א-ת]{2,}")
 # English preservation: Latin-script spans that must survive verbatim (verified, not masked)
 _EN_SENTINEL_RE = re.compile(re.escape(EN_OPEN) + r"\d+" + re.escape(EN_CLOSE))
 _PERSON_SENTINEL_RE = re.compile(re.escape(PERSON_OPEN) + r"\d+" + re.escape(PERSON_CLOSE))
-# Contiguous Latin-script run — excludes '/' so file-paths are not merged into English spans
-_EN_SPAN_RE = re.compile(r"[A-Za-z]{2,}(?:[ \t]*[A-Za-z0-9\-'\".,;:()&`]+)*")
+# Technical English tokens that must survive verbatim — restricted to capitalized/
+# code-like forms (not arbitrary Latin runs). Generic prose like "handles it"
+# is intentionally excluded so the model can re-flow sentences naturally.
+# Matches: acronyms (API), Title Case phrases (API Gateway, Kubernetes is single
+# capitalized word via last alternative), hyphen/slash tokens (CI/CD), CamelCase,
+# alphanum (OAuth2, S3). Excludes '/' so file-paths are not merged.
+# Single common words like "The"/"And" are filtered by _COMMON_ENGLISH set below.
+_EN_SPAN_RE = re.compile(
+    r"\b(?:"
+    r"[A-Z]{2,}(?:\s+[A-Z][a-z]+){0,2}"          # API, API Gateway
+    r"|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}"       # Two+ Title Case words
+    r"|[A-Za-z]+[-_/][A-Za-z0-9\-_./]+"          # hyphen/slash/underscore
+    r"|[A-Z][a-z]*[A-Z][a-zA-Z]*"                # CamelCase
+    r"|[A-Za-z]+[0-9][A-Za-z0-9]*"               # alphanum S3/OAuth2
+    r"|[A-Z][a-z]{2,}"                           # single Capitalized word (Kubernetes)
+    r")\b"
+)
+_COMMON_ENGLISH = frozenset({
+    "The", "This", "That", "These", "Those", "They", "There", "Then", "Than",
+    "And", "Or", "But", "With", "From", "For", "To", "Of", "In", "On", "At",
+    "By", "A", "An", "Is", "Are", "Was", "Were", "Be", "Been", "Being",
+    "It", "Its", "It", "As", "If", "So", "Not", "No", "Yes", "We", "You",
+    "He", "She", "Will", "Can", "Has", "Have", "Had", "Do", "Does", "Did",
+    "Handles", "Handle",  # generic verbs that should not be invariants alone
+})
 # URLs and file-paths to preserve verbatim
+# NOTE: \w is Unicode-aware in Python 3 and would match Hebrew, so file-path
+# alternatives use explicit [A-Za-z0-9_] and require at least one Latin letter.
 _URL_RE = re.compile(r"https?://[^\s<>\[\]()\"']+|www\.[^\s<>\[\]()\"']+")
 _FILEPATH_RE = re.compile(
-    r"(?:[A-Za-z]:)?[\\/][\w.\-/\\]+|"  # /abs/path or C:\path or \path
-    r"\b[\w.\-]+\.(?:md|py|json|csv|txt|pdf|docx|xlsx|png|jpg|jpeg|yaml|yml|toml|sh|js|ts)\b|"
-    r"\b[\w.\-]+/[\w.\-/]*"
+    r"(?:[A-Za-z]:)?[\\/][A-Za-z0-9_.\-/\\]+|"  # /abs/path or C:\path or \path
+    r"\b[A-Za-z0-9_.\-]+\.(?:md|py|json|csv|txt|pdf|docx|xlsx|png|jpg|jpeg|yaml|yml|toml|sh|js|ts)\b|"
+    r"\b(?=[A-Za-z0-9_.\-]*[A-Za-z])[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-/]*"
 )
 # YAML frontmatter and code sections — must be preserved verbatim and in order
 _YAML_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
@@ -119,10 +144,12 @@ def get_ledger_path(vault_root: Path, out_root: Path | None = None) -> Path:
 def load_config(vault_root: Path) -> dict:
     p = vault_root / "convert_config.json"
     if p.exists():
+        raw = p.read_text(encoding="utf-8")
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: invalid convert_config.json ({p}): {e}", file=sys.stderr)
+            raise RuntimeError(f"invalid convert_config.json: {e}") from e
     return {}
 
 
@@ -287,7 +314,7 @@ def _mask_via_tokens(text: str, name_to_sentinel: dict[str, str]) -> str:
         bg = f"{he_spans[i][2]} {he_spans[i + 1][2]}"
         if bg in bigram_set:
             sep = text[he_spans[i][1]: he_spans[i + 1][0]]
-            if sep in ("", " ", "\t", "\n", "־", "-", "־"):
+            if sep in (" ", "\t", "\n", "־", "-", "–", "—"):
                 replacements[i] = name_to_sentinel[bg]
                 skip.add(i + 1)
 
@@ -399,22 +426,41 @@ def unmask_english_spans(text: str, mapping: list[str]) -> str:
 # ── Preservation-by-verification (LLM sees raw text + invariants as context) ──
 
 def extract_english_spans(text: str) -> list[str]:
-    """Extract contiguous Latin-script spans that must be preserved verbatim.
+    """Extract technical English spans that must be preserved verbatim.
 
-    URLs/paths are excluded here (handled by extract_urls_and_paths).
-    A newline sentinel breaks spans that had a URL in the middle.
+    Restricted to capitalized/code-like tokens (see _EN_SPAN_RE) so generic
+    prose does not become an invariant. URLs/paths are excluded.
+    Sentence-internal spans are found via technical token regex; single common
+    words like "The" alone are filtered.
     """
     # Mask URLs/paths first so they don't pollute English spans
     masked = _URL_RE.sub("\n", text)
     masked = _FILEPATH_RE.sub("\n", masked)
     spans: list[str] = []
     for m in _EN_SPAN_RE.finditer(masked):
-        span = m.group(0).strip()
+        span = m.group(0).strip().strip(".,;:\"'()")
         if len(span) < 2 or len(re.findall(r"[A-Za-z]", span)) < 2:
             continue
-        # Must contain at least one 2+ letter word (avoid isolated numbers/punct)
         if not re.search(r"[A-Za-z]{2,}", span):
             continue
+        # Filter single common English words that are not technical
+        if span in _COMMON_ENGLISH:
+            continue
+        # For multi-word spans starting with a common word, strip it
+        # e.g. "The API Gateway" -> the regex already prefers "API Gateway",
+        # but guard anyway
+        first_word = span.split()[0] if span else ""
+        if first_word in _COMMON_ENGLISH and len(span.split()) > 1:
+            # If the technical signal is only after the common word, keep the tail
+            tail = span[len(first_word):].strip()
+            if tail and tail not in spans and tail not in _COMMON_ENGLISH:
+                # Re-validate tail is still technical
+                if _EN_SPAN_RE.search(tail):
+                    span = tail
+                else:
+                    continue
+            else:
+                continue
         if span not in spans:
             spans.append(span)
     return spans
@@ -435,6 +481,9 @@ def extract_urls_and_paths(text: str) -> list[str]:
         if len(s) < 3:
             continue
         if "/" not in s and "\\" not in s and "." not in s:
+            continue
+        # File-paths must contain at least one Latin letter (avoid date false-positives like 12/2024)
+        if not re.search(r"[A-Za-z]", s):
             continue
         # Avoid tiny fragments and duplicates of URLs
         if s in urls or s in paths:
@@ -1096,7 +1145,16 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
         try:
             with urllib.request.urlopen(req, timeout=90) as resp:
                 data = json.loads(resp.read().decode())
-            content = data["choices"][0]["message"]["content"]
+            choices = data.get("choices") if isinstance(data, dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+            if finish_reason == "length":
+                raise RuntimeError("LLM response truncated (finish_reason=length) — chunk too large or token limit hit")
+            msg = choice.get("message") if isinstance(choice, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not content:
+                # Fallback: original direct access for compat
+                content = data["choices"][0]["message"]["content"]
             obj = json.loads(content)
             return {
                 "translation": str(obj.get("translation", "")).strip(),
@@ -1104,12 +1162,20 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
                 "notes": list(obj.get("notes", [])),
             }
         except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")[:600]
-            last_err = f"HTTP {e.code}: {body}"
+            try:
+                body = e.read().decode(errors="replace")[:300]
+            except Exception:
+                body = str(e)[:300]
+            # Do not echo raw body to ledger verbatim — it may contain document content
+            last_err = f"HTTP {e.code}"
+            # Log body to stderr only (not persisted to ledger verbatim)
+            print(f"LLM HTTP {e.code}: {body[:200]}", file=sys.stderr)
             if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
                 continue
             raise RuntimeError(last_err) from e
+        except RuntimeError:
+            raise
         except Exception as e:
             last_err = str(e)
             if attempt < retries - 1:

@@ -54,10 +54,12 @@ HE_MARKER_RE = re.compile(r"⟦he:[^⟧]+⟧")
 def load_config(vault_root: Path) -> dict:
     p = vault_root / "convert_config.json"
     if p.exists():
+        raw = p.read_text(encoding="utf-8")
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: invalid convert_config.json ({p}): {e}", file=sys.stderr)
+            raise RuntimeError(f"invalid convert_config.json: {e}") from e
     return {}
 
 
@@ -168,8 +170,17 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode())
-        content = data["choices"][0]["message"]["content"]
+        choices = data.get("choices") if isinstance(data, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+            raise RuntimeError("reviewer LLM response truncated (finish_reason=length)")
+        msg = choice.get("message") if isinstance(choice, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not content:
+            content = data["choices"][0]["message"]["content"]
         return json.loads(content)
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"reviewer LLM call failed: {e}") from e
 

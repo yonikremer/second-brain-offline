@@ -53,10 +53,12 @@ def load_config(vault_root: Path) -> dict:
     path = vault_root / "convert_config.json"
     cfg = {}
     if path.exists():
+        raw = path.read_text(encoding="utf-8")
         try:
-            cfg = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+            cfg = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: invalid convert_config.json ({path}): {e}", file=sys.stderr)
+            raise RuntimeError(f"invalid convert_config.json: {e}") from e
     return cfg
 
 
@@ -150,13 +152,19 @@ def _call_llm(base_url: str, api_key: str, model: str, term: str, contexts: list
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:600]
-        raise RuntimeError(f"LLM HTTP {e.code}: {body}") from e
+        raise RuntimeError(f"LLM HTTP {e.code}") from e
     except Exception as e:
         raise RuntimeError(f"LLM call failed: {e}") from e
 
     try:
-        content = data["choices"][0]["message"]["content"]
+        choices = data.get("choices") if isinstance(data, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+            raise RuntimeError("LLM response truncated (finish_reason=length)")
+        msg = choice.get("message") if isinstance(choice, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not content:
+            content = data["choices"][0]["message"]["content"]
         obj = json.loads(content)
         return {
             "english": str(obj.get("english", "")).strip(),

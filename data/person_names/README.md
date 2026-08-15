@@ -13,5 +13,11 @@ last = set(open('data/person_names/last_names_ranked.txt', encoding='utf-8').rea
 # 2) Exact-match fallback: if token in first or token in last -> mask even if NER missed
 # 3) Log masked name not in lists -> human review queue ("new name candidate")
 ```
-Keep `data/person_names/` gitignored? Currently under `data/` (waived). Add to pipeline as offline bundle.
+## Attribution
+
+- `first_names.txt` includes 539 names from [faker-js](https://github.com/faker-js/faker) (`faker/src/locales/he/person/first_name.ts`, MIT) + manual Israeli common + Arab-Israeli additions (מוחמד, אחמד...).
+- `last_names_ranked.txt` includes frequency-ranked surnames from Wikipedia Israel top 30 + faker-js `he/person/last_name.ts` (MIT) + FamilySearch/BehindTheName + CBS.
+- `first_names_full.txt` (107,793, gitignored) is the full allowlist from data.gov.il `firs-name` (116,673 records, 2020-09-14) — kept for recall, not committed.
+
+All committed lists (`first_names.txt`, `last_names_ranked.txt`, `codenames.txt`) are part of the offline bundle. The large raw `first_names_full.txt` and intermediate `first_names_raw.*` / `faker_first.json` remain gitignored (see `.gitignore`).
 
