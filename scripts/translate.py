@@ -46,6 +46,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+try:
+    from translation_common import read_csv_lines_skip_comments as _shared_read_csv
+    _HAS_SHARED = True
+except ImportError:
+    try:
+        from scripts.translation_common import read_csv_lines_skip_comments as _shared_read_csv
+        _HAS_SHARED = True
+    except ImportError:
+        _HAS_SHARED = False
 import hashlib
 import json
 import os
@@ -155,7 +164,9 @@ def resolve_corpus_dir(vault_root: Path, explicit: Path | None = None) -> Path:
 
 
 def _read_csv_skip_comments(path: Path) -> list[str]:
-    """Read CSV text stripping # comment and empty lines (matches check_glossary)."""
+    """Read CSV text stripping # comment and empty lines (matches check_glossary) — via translation_common."""
+    if _HAS_SHARED:
+        return _shared_read_csv(path)
     text = path.read_text(encoding="utf-8")
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 

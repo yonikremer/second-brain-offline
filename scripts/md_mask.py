@@ -41,12 +41,21 @@ def _looks_like_table_row(line: str) -> bool:
 
 
 def _split_table_cells(row: str) -> list[str]:
-    """Split a GFM row on unescaped pipes.
+    """Split a GFM row on unescaped pipes — via translation_common (single source of truth).
 
     After inline code masking, a cell like `a|b` is already <<<CODE_n>>>,
     so a bare | scan is safe. Escaped \\| is preserved.
     Leading/trailing empties from outer pipes are dropped.
     """
+    try:
+        from translation_common import split_table_cells as _shared
+        return _shared(row)
+    except ImportError:
+        try:
+            from scripts.translation_common import split_table_cells as _shared
+            return _shared(row)
+        except ImportError:
+            pass
     parts: list[str] = []
     cur = ""
     i = 0
@@ -68,8 +77,6 @@ def _split_table_cells(row: str) -> list[str]:
     if parts and parts[-1].strip() == "":
         parts = parts[:-1]
     return parts
-
-
 def extract_table_cells(lines: list[str]) -> list[str]:
     """Extract all cell texts from detected table blocks (for testing / direct use)."""
     cells: list[str] = []

@@ -33,6 +33,17 @@ import re
 import sys
 from pathlib import Path
 
+# Shared helpers (deduped) — translation_common is single source of truth
+try:
+    from translation_common import read_csv_lines_skip_comments as _shared_read_csv, strip_frontmatter as _shared_strip_fm, split_table_cells as _shared_split_cells
+    _USE_SHARED = True
+except ImportError:
+    try:
+        from scripts.translation_common import read_csv_lines_skip_comments as _shared_read_csv, strip_frontmatter as _shared_strip_fm, split_table_cells as _shared_split_cells
+        _USE_SHARED = True
+    except ImportError:
+        _USE_SHARED = False
+
 HEBREW_RE = re.compile(r"[א-ת]")
 HE_MARKER_RE = re.compile(r"⟦he:[^⟧]+⟧")
 HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
@@ -47,6 +58,9 @@ _TABLE_SEP_QA_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
 
 
 def _split_row_cells(row: str) -> list[str]:
+    """Split GFM row on unescaped pipes — via translation_common (kept for compat)."""
+    if _USE_SHARED:
+        return _shared_split_cells(row)
     parts: list[str] = []
     cur = ""
     j = 0
@@ -68,8 +82,6 @@ def _split_row_cells(row: str) -> list[str]:
     if parts and parts[-1].strip() == "":
         parts = parts[:-1]
     return parts
-
-
 def _parse_tables(text: str) -> list[list[list[str]]]:
     """Parse GFM tables into list of tables, each table is list of rows, each row is list of cells."""
     lines = text.split("\n")
@@ -126,7 +138,9 @@ def check_table_fidelity(source_body: str, trans_body: str) -> dict:
 
 
 def _read_csv_skip_comments(path: Path) -> list[str]:
-    """Strip # comment and empty lines before DictReader (matches check_glossary)."""
+    """Strip # comment and empty lines before DictReader (matches check_glossary) — via translation_common."""
+    if _USE_SHARED:
+        return _shared_read_csv(path)
     text = path.read_text(encoding="utf-8")
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 
@@ -199,6 +213,9 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
 
 
 def _strip_frontmatter(text: str) -> tuple[str, str]:
+    """Via translation_common (single source of truth)."""
+    if _USE_SHARED:
+        return _shared_strip_fm(text)
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
         if end != -1:

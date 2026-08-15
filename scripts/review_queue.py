@@ -7,7 +7,8 @@ Markdown packets under data/review_queue/<batch>.md are rendered views, not pars
 Schema:
   FIELDNAMES = [term_he, english, keep_source, notes, status, example_doc,
                 context_snippets, occurrences, blocked_docs, question_id]
-  VALID_STATUSES = {approved, proposed, keep_source, pending}
+  # NOTE: keep_source is intentionally string "0"/"1" in glossary CSV (not bool) — keep as is for CSV compat.
+VALID_STATUSES = {approved, proposed, keep_source, pending}
 
 Commands:
   list       csv                              # list pending rows
@@ -23,12 +24,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+try:
+    from translation_common import read_csv_lines_skip_comments
+except ImportError:
+    from scripts.translation_common import read_csv_lines_skip_comments
 import hashlib
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# NOTE: keep_source is intentionally string "0"/"1" in glossary CSV (not bool) — keep as is for CSV compat.
 VALID_STATUSES = {"approved", "proposed", "keep_source", "pending"}
 FIELDNAMES = ["term_he", "english", "keep_source", "notes", "status", "example_doc",
               "context_snippets", "occurrences", "blocked_docs", "question_id"]
@@ -56,8 +62,8 @@ def cmd_gen_packets(csv_path: Path, out_dir: Path, batch: int = 20):
     if not csv_path.exists():
         print(f"queue not found: {csv_path}", file=sys.stderr)
         sys.exit(1)
-    with open(csv_path, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    lines = read_csv_lines_skip_comments(csv_path)
+    rows = list(csv.DictReader(lines)) if lines else []
     pending = [r for r in rows if r.get("status") != "approved"]
     # Order: blocked_docs desc
     pending.sort(key=lambda r: (-int(r.get("blocked_docs") or 0), r.get("term_he") or ""))
@@ -86,12 +92,16 @@ def cmd_parse(csv_path: Path, ledger_path: Path | None, dry_run: bool = False):
     if not csv_path.exists():
         print(f"queue not found: {csv_path}", file=sys.stderr)
         sys.exit(1)
-    with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            print("empty queue", file=sys.stderr)
-            sys.exit(1)
-        rows = list(reader)
+    # Strip # comments like glossary loaders (review_queue.py:95 fix)
+    lines = read_csv_lines_skip_comments(csv_path)
+    if not lines:
+        print("empty queue", file=sys.stderr)
+        sys.exit(1)
+    reader = csv.DictReader(lines)
+    if not reader.fieldnames:
+        print("empty queue", file=sys.stderr)
+        sys.exit(1)
+    rows = list(reader)
 
     errors: list[str] = []
     for i, r in enumerate(rows, 2):
@@ -155,8 +165,8 @@ def cmd_clean(csv_path: Path):
     if not csv_path.exists():
         print(f"queue not found: {csv_path}", file=sys.stderr)
         sys.exit(1)
-    with open(csv_path, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    lines = read_csv_lines_skip_comments(csv_path)
+    rows = list(csv.DictReader(lines)) if lines else []
     pending = [r for r in rows if r.get("status") != "approved"]
     if pending:
         print(f"{len(pending)} pending rows remain, not cleaning.")

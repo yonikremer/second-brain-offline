@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+try:
+    from translation_common import strip_csv_comments
+except ImportError:
+    from scripts.translation_common import strip_csv_comments
 import sys
 from pathlib import Path
 
@@ -37,8 +41,8 @@ def check_glossary(path: Path) -> tuple[bool, list[str]]:
     except OSError as e:
         return False, [f"cannot read glossary: {e}"]
 
-    # Strip empty / comment lines (plan template has '# ...' comment lines)
-    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    # Strip empty / comment lines (plan template has '# ...' comment lines) — via translation_common
+    lines = strip_csv_comments(text)
     try:
         reader = csv.DictReader(lines)
     except Exception as e:

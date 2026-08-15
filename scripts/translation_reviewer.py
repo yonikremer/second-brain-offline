@@ -37,6 +37,17 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+# Shared helpers — translation_common is single source of truth
+try:
+    from translation_common import read_csv_lines_skip_comments as _shared_read_csv, strip_frontmatter as _shared_strip_fm
+    _USE_SHARED = True
+except ImportError:
+    try:
+        from scripts.translation_common import read_csv_lines_skip_comments as _shared_read_csv, strip_frontmatter as _shared_strip_fm
+        _USE_SHARED = True
+    except ImportError:
+        _USE_SHARED = False
+
 HE_MARKER_RE = re.compile(r"⟦he:[^⟧]+⟧")
 
 
@@ -51,6 +62,9 @@ def load_config(vault_root: Path) -> dict:
 
 
 def _strip_frontmatter(text: str) -> tuple[str, str]:
+    """Via translation_common (single source of truth)."""
+    if _USE_SHARED:
+        return _shared_strip_fm(text)
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
         if end != -1:
@@ -72,7 +86,9 @@ def _load_translation(path: Path) -> tuple[dict, str]:
 
 
 def _read_csv_skip_comments(path: Path) -> list[str]:
-    """Strip # comment and empty lines before DictReader (matches check_glossary)."""
+    """Strip # comment and empty lines before DictReader (matches check_glossary) — via translation_common."""
+    if _USE_SHARED:
+        return _shared_read_csv(path)
     text = path.read_text(encoding="utf-8")
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 

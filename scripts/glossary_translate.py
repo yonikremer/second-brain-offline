@@ -28,6 +28,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+try:
+    from translation_common import strip_csv_comments
+    from translation_common import read_csv_lines_skip_comments
+except ImportError:
+    from scripts.translation_common import strip_csv_comments
+    from scripts.translation_common import read_csv_lines_skip_comments
 import hashlib
 import json
 import os
@@ -203,7 +209,7 @@ def main(argv=None):
     # Read seed (strip # comment / empty lines like check_glossary)
     seed_rows: list[dict] = []
     text = input_csv.read_text(encoding="utf-8")
-    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    lines = strip_csv_comments(text)
     if not lines:
         print("translation_seed.csv has no rows — nothing to translate (empty corpus or all terms filtered)", file=sys.stderr)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
