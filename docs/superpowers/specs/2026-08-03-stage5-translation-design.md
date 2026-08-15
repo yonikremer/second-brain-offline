@@ -72,29 +72,66 @@ QA gate: residual-Hebrew ratio band, length-ratio band, structural tolerances.
 All three are versioned vault artifacts, hashed into the ledger. A version bump marks
 affected documents stale and schedules re-translation.
 
-1. **Translation policy** (`campaigns/<campaign>/translation-policy.md`) — which terms
-   stay Hebrew or transliterated versus translated; acronym handling; heading treatment;
-   units, standards, and part-number references; org-internal names; how to render
-   quoted or embedded English. One policy per domain; a campaign inherits and may
-   override.
-2. **Glossary** (`campaigns/<campaign>/glossary.md`) — one row per term:
-   `term_he | english | notes | status (approved|proposed|keep_source) | first_seen_doc | approved_by | version_added`.
-3. **Reference translations** (`campaigns/<campaign>/references/`).
+Policy and glossary are keyed by **domain**, not by work unit — they are durable
+knowledge assets, while work units are scheduling artifacts that come and go.
 
-## Glossary bootstrapping (front-loaded, not discovered per document)
+1. **Translation policy** — `policy/organization.md` plus `policy/<domain>.md`. Covers
+   which terms stay Hebrew or transliterated versus translated; acronym handling;
+   heading treatment; units, standards, and part-number references; org-internal names;
+   how to render quoted or embedded English. A domain policy inherits the organization
+   policy and states only its differences.
+2. **Glossary — layered** (see below): `glossary/organization.md`,
+   `glossary/<domain>.md`, and where genuinely needed `glossary/<domain>/<subdomain>.md`.
+3. **Reference translations** (`references/<domain>/`).
 
-Before a campaign translates anything:
+### Layered glossary
 
-1. A term-extraction pass over the campaign's Hebrew documents produces candidate terms
-   ranked by **corpus frequency** and document spread (a term in 50 documents outranks
-   one in 2), using frequency, acronym and quoted-string patterns, and out-of-vocabulary
-   heuristics.
-2. The expert defines the top slice in one sitting — this is the single highest-leverage
-   hour in the stage.
-3. Remaining unknowns surface during translation through the question queue below.
+Most of this corpus's terminology is organization-wide; domain-specific vocabulary is
+comparatively small, and only occasionally does one subdomain rename a shared concept.
+A flat per-work-unit glossary would therefore copy the same hundreds of terms into every
+domain and let them drift apart — the same source term rendered two ways in two domains
+is precisely the failure a terminology-precise vault cannot tolerate.
 
-This replaces reactive, per-document term discovery: a term is answered once, before it
-interrupts fifty documents.
+**Resolution:** lookup walks subdomain → domain → organization; the narrowest definition
+wins.
+
+**Row schema:**
+
+```
+term_src | english | layer (org|domain|subdomain) | origin (internal|external)
+         | canonical_source (external only) | overrides (parent entry + reason)
+         | status (approved|proposed|keep_source) | first_seen_doc | approved_by | version_added
+```
+
+**`origin: external`** marks terms owned by standards bodies, vendors, or academic
+literature. Their English form is canonical and must not be re-derived: a Hebrew
+document that originally translated an English standard term has to round-trip back to
+the *same* English word, not a plausible synonym. The QA gate's `glossary_retention`
+check enforces this exactly.
+
+**Overrides are explicit.** A domain or subdomain entry that redefines an inherited term
+must name the entry it overrides and give a reason. An unregistered divergence from a
+parent layer is reported as a defect, never silently accepted.
+
+## Glossary bootstrapping (front-loaded, layered)
+
+**Organization layer — once, before any domain work.** A term-extraction pass over a
+stratified sample spanning *all* domains produces candidates ranked by frequency and by
+**spread across domains**. Spread is what places a term: appearing throughout the corpus
+means organizational, concentrated in one domain means domain-level. The expert confirms
+placement and defines the top slice in one sitting. Because organizational terms cover
+most of the corpus, this single session buys terminology coverage everywhere and is the
+highest-leverage hour in the entire pipeline.
+
+**Domain layer — at each work unit's kickoff.** The same extraction restricted to that
+domain, with organization-layer terms already resolved and excluded. What remains is
+small: genuinely domain-specific vocabulary plus any deliberate overrides.
+
+**Remaining unknowns** surface during translation through the question queue below, and
+are placed into the correct layer when answered.
+
+This replaces reactive, per-document term discovery: a term is answered once, at the
+right layer, before it interrupts fifty documents.
 
 ## Translation execution
 
@@ -138,8 +175,9 @@ is scripted and the model does not grade itself.
 |-------|---------|-----------|
 | `residual_hebrew_ratio` | Untranslated spans; over-literal retention | Band *(fit)* per paragraph and per document |
 | `untranslated_block` | Whole paragraphs left in Hebrew | Zero tolerance outside `⟦he:⟧` markers |
-| `glossary_retention` | Glossary term rendered against the glossary | 100% |
-| `glossary_consistency` | Same source term rendered differently across the campaign | 100% |
+| `glossary_retention` | Term rendered against its resolved glossary entry | 100% |
+| `glossary_consistency` | Same source term rendered differently across the corpus, at any layer | 100% |
+| `unregistered_override` | A domain rendering an inherited term differently without a declared override | Zero |
 | `forbidden_term` | Renderings the policy explicitly bans | Zero |
 | `heading_fidelity` | Heading count and nesting preserved | Exact |
 | `structure_fidelity` | List item counts, table rows/columns, code blocks preserved | Exact |

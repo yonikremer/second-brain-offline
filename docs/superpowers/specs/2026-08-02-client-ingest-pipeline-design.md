@@ -88,7 +88,8 @@ borderline band.
 
 ### Campaign planning — questionnaire + dependency graph
 
-A shipped artifact, `templates/campaign-plan-questionnaire.md`, guides the expert +
+A shipped artifact, `templates/ingest-pipeline/` (a step-per-folder questionnaire with an
+index README and shared `domains.md` / `sources.md`), guides the expert +
 infra supporter to produce the **campaign plan**: guiding questions covering
 domain/subdomain enumeration, source→domain mapping, overlap pairs and **which campaign
 owns each overlap first**, trust tier per source category, foundational→advanced

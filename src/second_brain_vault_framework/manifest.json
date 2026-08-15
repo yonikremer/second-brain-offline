@@ -8,7 +8,18 @@
     ".claude/skills/vault-query/SKILL.md",
     ".claude/skills/vault-lint/SKILL.md",
     "scripts/vault.py",
-    "scripts/check_vault_answer.py"
+    "scripts/check_vault_answer.py",
+    "templates/ingest-pipeline/01-assess/GUIDANCE.md",
+    "templates/ingest-pipeline/01-assess/QUESTIONS.md",
+    "templates/ingest-pipeline/02-filtering/QUESTIONS.md",
+    "templates/ingest-pipeline/03-translation/GUIDANCE.md",
+    "templates/ingest-pipeline/03-translation/QUESTIONS.md",
+    "templates/ingest-pipeline/04-classification/QUESTIONS.md",
+    "templates/ingest-pipeline/05-domain-model/QUESTIONS.md",
+    "templates/ingest-pipeline/06-success-criteria/QUESTIONS.md",
+    "templates/ingest-pipeline/README.md",
+    "templates/ingest-pipeline/domains.md",
+    "templates/ingest-pipeline/sources.md"
   ],
   "scaffold_only_paths": [
     "tests/VAULT_TESTS.md"
