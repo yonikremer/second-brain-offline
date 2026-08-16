@@ -1,0 +1,511 @@
+import argparse
+import random
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+from helpers import compute_file_hash, db_conn, parse_allowed_values
+
+
+REQUIRED_FRONTMATTER_KEYS = [
+    "original_path",
+    "file_hash",
+    "subdomain",
+    "document_type",
+    "truthness_score",
+    "truthness_justification",
+    "language",
+    "model",
+]
+
+
+def load_allowed_categories(instruction_path: Path) -> set[str]:
+    return set(parse_allowed_values(instruction_path))
+
+
+def _extract_frontmatter(out_path: Path) -> tuple[dict | None, str]:
+    content = out_path.read_text(encoding="utf-8")
+    if not content.startswith("---"):
+        return None, content
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None, content
+    try:
+        fm = yaml.safe_load(parts[1])
+    except Exception:
+        return None, content
+    return (fm if isinstance(fm, dict) else None), parts[2]
+
+
+def check_processed_file(
+    out_path: Path,
+    raw_root: Path,
+    allowed_subdomains: set[str],
+    allowed_doc_types: set[str],
+) -> dict:
+    result = {"path": str(out_path), "errors": [], "warnings": []}
+    fm, body = _extract_frontmatter(out_path)
+    if fm is None:
+        result["errors"].append("Missing or malformed YAML frontmatter")
+        return result
+
+    for key in REQUIRED_FRONTMATTER_KEYS:
+        if key not in fm:
+            result["errors"].append(f"Missing frontmatter key: {key}")
+
+    if not body.strip():
+        result["warnings"].append("Empty body")
+
+    subdomain = fm.get("subdomain")
+    if subdomain not in allowed_subdomains:
+        result["errors"].append(f"Unknown subdomain: {subdomain}")
+
+    doc_type = fm.get("document_type")
+    if doc_type not in allowed_doc_types:
+        result["errors"].append(f"Unknown document_type: {doc_type}")
+
+    score = fm.get("truthness_score")
+    if not isinstance(score, (int, float)) or score < 0 or score > 10:
+        result["errors"].append(f"Invalid truthness_score: {score}")
+
+    original_path = fm.get("original_path")
+    file_hash = fm.get("file_hash")
+    if original_path and file_hash:
+        src = raw_root / original_path
+        if not src.exists():
+            result["errors"].append(f"original_path not found: {original_path}")
+        elif compute_file_hash(src) != str(file_hash):
+            result["errors"].append("file_hash mismatch (stale output)")
+
+    return result
+
+
+def _is_critical_error(error: str) -> bool:
+    """Return True if this error represents a hard failure (vs a soft warning)."""
+    critical_keywords = (
+        "not found:",  # missing output or original_path
+        "Missing or malformed YAML frontmatter",
+        "Missing frontmatter key:",
+        "Unknown subdomain:",
+        "Unknown document_type:",
+        "Invalid truthness_score:",
+        "mismatch",
+        "Raw path is not under raw_root",
+    )
+    lower = error.lower()
+    return any(kw.lower() in lower for kw in critical_keywords)
+
+
+def check_output_health(
+    raw_root: Path,
+    processed_md_root: Path,
+    db_path: Path,
+    instructions_root: Path,
+) -> dict[str, Any]:
+    allowed_subdomains = load_allowed_categories(instructions_root / "subdomains.md")
+    allowed_doc_types = load_allowed_categories(instructions_root / "document_types.md")
+    statuses = get_file_statuses(db_path)
+    processed_paths = [
+        Path(fp) for fp, info in statuses.items() if info.get("status") == "processed"
+    ]
+
+    checked = []
+    missing_outputs = []
+    raw_root_resolved = raw_root.resolve()
+    for raw_path in processed_paths:
+        try:
+            rel = raw_path.relative_to(raw_root_resolved)
+        except ValueError:
+            checked.append(
+                {
+                    "path": str(raw_path),
+                    "errors": ["Raw path is not under raw_root"],
+                    "warnings": [],
+                }
+            )
+            continue
+        out_path = processed_md_root / rel.with_suffix(".md")
+        if not out_path.exists():
+            missing_outputs.append(str(rel.as_posix()))
+            continue
+        checked.append(
+            check_processed_file(
+                out_path, raw_root_resolved, allowed_subdomains, allowed_doc_types
+            )
+        )
+
+    errors = missing_outputs + [
+        f"{c['path']}: {e}" for c in checked for e in c["errors"]
+    ]
+    warnings = [f"{c['path']}: {w}" for c in checked for w in c["warnings"]]
+
+    # A check is 'critical' only when there are hard failures; pure content
+    # warnings (e.g. empty body) do NOT escalate to exit code 1.
+    has_critical = any(_is_critical_error(e) for e in errors)
+
+    return {
+        "name": "Output health",
+        "ok": not errors,
+        "critical": has_critical,
+        "details": {
+            "processed_count": len(processed_paths),
+            "missing_outputs": missing_outputs,
+            "file_errors": checked,
+        },
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+TERMINAL_STATUSES = {"processed", "filtered", "error", "needs_review", "skipped"}
+
+
+def get_raw_files(raw_root: Path) -> list[Path]:
+    files = []
+    for p in raw_root.rglob("*"):
+        if p.is_file() and not p.name.startswith("."):
+            files.append(p.resolve())
+    return sorted(files)
+
+
+def get_file_statuses(db_path: Path) -> dict[str, dict]:
+    conn = db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT filepath, file_hash, status, error_message FROM files")
+        return {row["filepath"]: dict(row) for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def check_coverage(raw_files: list[Path], file_statuses: dict[str, dict]) -> dict[str, Any]:
+    # Normalize paths to POSIX so Windows raw paths match POSIX DB entries.
+    raw_strs = {Path(p).as_posix() for p in raw_files}
+    normalized_statuses = {Path(k).as_posix(): v for k, v in file_statuses.items()}
+    missing = sorted(raw_strs - set(normalized_statuses))
+    statuses = list(normalized_statuses.values())
+    pending = [s for s in statuses if s.get("status") == "pending"]
+    unknown = [s for s in statuses if s.get("status") not in TERMINAL_STATUSES | {"pending"}]
+    terminal_count = sum(1 for s in statuses if s.get("status") in TERMINAL_STATUSES)
+    ok = (
+        not missing
+        and not pending
+        and not unknown
+        and terminal_count == len(raw_files)
+    )
+    return {
+        "name": "Coverage",
+        "ok": ok,
+        "critical": True,
+        "details": {
+            "raw_count": len(raw_files),
+            "db_count": len(file_statuses),
+            "missing": missing,
+            "pending_count": len(pending),
+            "unknown_status_count": len(unknown),
+            "terminal_count": terminal_count,
+        },
+    }
+
+
+def check_review_queue(db_path: Path, total_files: int, high_rate_threshold: float = 0.25) -> dict[str, Any]:
+    conn = db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT stage, trigger_type, status FROM review_queue")
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    pending = [r for r in rows if r["status"] == "pending"]
+    stale = [r for r in rows if r["status"] == "stale"]
+    by_trigger = Counter((r["stage"], r["trigger_type"]) for r in pending)
+    review_rate = len(pending) / total_files if total_files else 0.0
+    high_triggers = [
+        {"stage": s, "trigger": t, "count": c}
+        for (s, t), c in by_trigger.items()
+        if c / total_files > high_rate_threshold
+    ] if total_files else []
+
+    return {
+        "name": "Review queue signal",
+        "ok": review_rate <= high_rate_threshold,
+        "critical": False,
+        "details": {
+            "pending_count": len(pending),
+            "stale_count": len(stale),
+            "review_rate": review_rate,
+            "by_trigger": dict(by_trigger),
+            "high_triggers": high_triggers,
+        },
+    }
+
+
+def sample_files(processed_paths: list[Path], sample_size: int, seed: int | None = None) -> list[Path]:
+    if seed is not None:
+        random.seed(seed)
+    if len(processed_paths) <= sample_size:
+        return processed_paths
+    return random.sample(processed_paths, sample_size)
+
+
+def get_file_hash(db_path: Path, filepath: Path) -> str | None:
+    conn = db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_hash FROM files WHERE filepath = ?", (str(filepath),))
+        row = cursor.fetchone()
+        return row["file_hash"] if row else None
+    finally:
+        conn.close()
+
+
+def get_stage_outputs(db_path: Path, file_hash: str) -> dict[str, dict]:
+    conn = db_conn(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT stage_name, output_text, model_name, instructions_hash "
+            "FROM stage_outputs WHERE file_hash = ?",
+            (file_hash,),
+        )
+        return {row["stage_name"]: dict(row) for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def build_forensics(
+    raw_path: Path,
+    db_path: Path,
+    raw_root: Path,
+    processed_md_root: Path,
+    review_dir: Path | None = None,
+) -> dict:
+    file_hash = get_file_hash(db_path, raw_path)
+    rel_path = raw_path.relative_to(raw_root.resolve())
+    out_path = processed_md_root / rel_path.with_suffix(".md")
+    fm, _ = _extract_frontmatter(out_path) if out_path.exists() else (None, "")
+
+    review_files = []
+    if file_hash and review_dir is not None and review_dir.exists():
+        short_hash = file_hash[:8]
+        review_files = [str(p) for p in review_dir.glob(f"*{short_hash}*.md")]
+
+    return {
+        "raw_path": str(raw_path),
+        "processed_path": str(out_path),
+        "rel_path": str(rel_path.as_posix()),
+        "current_hash": compute_file_hash(raw_path) if raw_path.exists() else None,
+        "db_hash": file_hash,
+        "stage_outputs": get_stage_outputs(db_path, file_hash) if file_hash else {},
+        "processed_frontmatter": fm,
+        "review_files": review_files,
+    }
+
+
+def _status_table(statuses: dict[str, dict]) -> dict[str, int]:
+    counts = Counter(s.get("status", "unknown") for s in statuses.values())
+    return dict(counts)
+
+
+def build_report(
+    raw_root: Path,
+    processed_md_root: Path,
+    db_path: Path,
+    instructions_root: Path,
+    sample_size: int,
+    seed: int | None,
+    review_dir: Path | None = None,
+) -> dict:
+    raw_files = get_raw_files(raw_root)
+    statuses = get_file_statuses(db_path)
+
+    coverage = check_coverage(raw_files, statuses)
+    output_health = check_output_health(
+        raw_root, processed_md_root, db_path, instructions_root
+    )
+    review_queue = check_review_queue(db_path, total_files=len(raw_files))
+
+    # Build sample set: all error/needs_review files + random subset of processed
+    error_paths = [Path(fp) for fp, info in statuses.items()
+                   if info.get("status") in ("error", "needs_review")]
+    processed_paths = [Path(fp) for fp, info in statuses.items()
+                       if info.get("status") == "processed"]
+
+    forced_samples = list(error_paths)
+    random_count = max(0, sample_size - len(forced_samples))
+    random_sample = sample_files(processed_paths, random_count, seed=seed) if random_count else []
+    sample_set = sorted(set(p.as_posix() for p in forced_samples)
+                        | set(p.as_posix() for p in random_sample), key=str)
+
+    # Convert posix strings back to Path objects for forensics lookup
+    sample_paths = [Path(p) for p in sample_set]
+    forensics = [
+        build_forensics(p, db_path, raw_root, processed_md_root, review_dir)
+        for p in sample_paths
+    ]
+    # Index forensics by rel_path for anchor lookups
+    forensics_by_rel = {f["rel_path"]: f for f in forensics}
+
+    checks = [coverage, output_health, review_queue]
+    critical_failures = sum(1 for c in checks if c.get("critical") and not c["ok"])
+    warning_checks = sum(1 for c in checks if not c.get("critical") and not c["ok"])
+
+    # Build sample entries keyed by rel_path for cross-reference with forensics
+    sample_entries = {}
+    for p in sample_paths:
+        entry_raw = build_forensics(p, db_path, raw_root, processed_md_root, review_dir)
+        sample_entries[entry_raw["rel_path"]] = {
+            "raw": str(p),
+            "processed_path": entry_raw["processed_path"],
+            "db_hash": entry_raw.get("db_hash"),
+        }
+    samples_list = list(sample_entries.values())
+
+    # Build sample entries from forensics data (no duplicate DB calls)
+    samples_list = []
+    for f in forensics:
+        samples_list.append({
+            "raw": f["raw_path"],
+            "processed_path": f["processed_path"],
+            "rel_path": f["rel_path"],
+            "db_hash": f.get("db_hash"),
+        })
+
+    return {
+        "summary": {
+            "total": len(raw_files),
+            "critical_failures": critical_failures,
+            "warnings": warning_checks,
+            "review_rate": review_queue["details"]["review_rate"],
+            "status_counts": _status_table(statuses),
+        },
+        "checks": [
+            {"name": c["name"], "ok": c["ok"], "detail": _check_detail(c)}
+            for c in checks
+        ],
+        "review_breakdown": [
+            {"stage": s, "trigger": t, "count": count}
+            for (s, t), count in review_queue["details"]["by_trigger"].items()
+        ],
+        "samples": samples_list,
+        "forensics": forensics,
+    }
+
+
+def _check_detail(check: dict) -> str:
+    if check["ok"]:
+        return "PASS"
+    if check["name"] == "Coverage":
+        d = check["details"]
+        return f"missing={len(d['missing'])}, pending={d['pending_count']}, unknown={d['unknown_status_count']}"
+    if check["name"] == "Output health":
+        return f"errors={len(check.get('errors', []))}, warnings={len(check.get('warnings', []))}"
+    if check["name"] == "Review queue signal":
+        return f"rate={check['details']['review_rate']:.1%}, pending={check['details']['pending_count']}"
+    return "FAIL"
+
+
+def write_report(report: dict, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Pipeline Real-Docs Evaluation Report\n\n"]
+    lines.append(f"Generated: {datetime.now().isoformat()}\n\n")
+
+    summary = report["summary"]
+    lines.append("## Summary\n\n")
+    lines.append(f"- Total raw files: {summary['total']}\n")
+    lines.append(f"- Critical failures: {summary['critical_failures']}\n")
+    lines.append(f"- Warnings: {summary['warnings']}\n")
+    lines.append(f"- Review rate: {summary['review_rate']:.1%}\n\n")
+
+    lines.append("## Coverage\n\n")
+    lines.append("| Status | Count |\n|---|---|\n")
+    for status, count in sorted(summary["status_counts"].items()):
+        lines.append(f"| {status} | {count} |\n")
+    lines.append("\n")
+
+    lines.append("## Checks\n\n")
+    lines.append("| Check | Result | Detail |\n|---|---|---|\n")
+    for c in report["checks"]:
+        result = "PASS" if c["ok"] else "FAIL"
+        lines.append(f"| {c['name']} | {result} | {c['detail']} |\n")
+    lines.append("\n")
+
+    lines.append("## Review queue breakdown\n\n")
+    if report["review_breakdown"]:
+        lines.append("| Stage | Trigger | Count |\n|---|---|---|\n")
+        for item in report["review_breakdown"]:
+            lines.append(f"| {item['stage']} | {item['trigger']} | {item['count']} |\n")
+    else:
+        lines.append("No pending review items.\n")
+    lines.append("\n")
+
+    lines.append("## Sample spot-check\n\n")
+    if report["samples"]:
+        for item in report["samples"]:
+            status = ""
+            if item.get("db_hash"):
+                status = f" (score: {item.get('db_hash', '')[:8]}...)"
+            lines.append(f"- `{item['raw']}` → `{item['processed_path']}`{status}\n")
+    else:
+        lines.append("No files to sample.\n")
+    lines.append("\n")
+
+    lines.append("## Forensics\n\n")
+    for f in report["forensics"]:
+        lines.append(f"### `{f['rel_path']}`\n\n")
+        lines.append(f"- Raw: `{f['raw_path']}`\n")
+        lines.append(f"- Processed: `{f['processed_path']}`\n")
+        lines.append(f"- DB hash: {f['db_hash']}\n")
+        lines.append(f"- Current hash: {f['current_hash']}\n")
+        lines.append("- Stage outputs:\n")
+        for stage, data in f["stage_outputs"].items():
+            preview = (data.get("output_text") or "")[:200].replace("\n", " ")
+            lines.append(f"  - `{stage}`: {preview}\n")
+        if f["review_files"]:
+            lines.append("- Review files:\n")
+            for rf in f["review_files"]:
+                lines.append(f"  - `{rf}`\n")
+        lines.append("\n")
+
+    out_path.write_text("".join(lines), encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate the document pipeline on real docs.")
+    parser.add_argument("--raw", type=Path, default=Path("raw"))
+    parser.add_argument("--processed", type=Path, default=Path("processed_md"))
+    parser.add_argument("--db", type=Path, default=Path("pipeline.db"))
+    parser.add_argument("--instructions", type=Path, default=Path("instructions"))
+    parser.add_argument("--report-dir", type=Path, default=Path("eval_reports"))
+    parser.add_argument("--sample-size", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--review-dir", type=Path, default=Path("review"))
+    args = parser.parse_args()
+
+    report = build_report(
+        args.raw,
+        args.processed,
+        args.db,
+        args.instructions,
+        args.sample_size,
+        args.seed,
+        args.review_dir,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = args.report_dir / f"eval_report_{timestamp}.md"
+    write_report(report, report_path)
+    print(f"Report written to {report_path}")
+
+    critical_failures = report["summary"]["critical_failures"]
+    if critical_failures:
+        print(f"CRITICAL FAILURES: {critical_failures}")
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
