@@ -243,7 +243,7 @@ from .translation_llm import call_llm, mock_translate
 
 from .translation_prompt import build_prompt, build_fix_prompt, _build_chunked_fix_prompts, format_qa_failures
 from . import translation_qa as qa_mod
-from .translation_common import compute_glossary_version as _compute_gv
+from .translation_common import compute_glossary_version as _compute_gv, _normalize_en_for_collision
 
 
 def run_qa_for_doc(source_path: Path, trans_body: str, trans_meta: dict,
@@ -286,7 +286,7 @@ def _glossary_fingerprint(glossary: list[dict]) -> str:
     cached chunk, because the injected term list changes.
     """
     rows = sorted([
-        (str(r.get("term_he", "")), tuple(sorted(str(o) for o in (r.get("translations") or []))),
+        (str(r.get("term_he", "")), tuple(sorted(_normalize_en_for_collision(str(o)) for o in (r.get("translations") or []))),
          str(r.get("keep_source", "")), str(r.get("status", "")))
         for r in glossary
     ], key=lambda x: x[0])

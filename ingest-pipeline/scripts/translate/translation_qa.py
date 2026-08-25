@@ -375,37 +375,52 @@ def check_glossary_translations(body: str, term_map: list[dict]) -> dict:
             continue
         exp = int(e.get("occurrences", 1))
         counts: dict[str, int] = {}
+        consumed: list[tuple[int,int]] = []
+        for opt in sorted(translations, key=len, reverse=True):
+            pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(opt) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+            c = 0
+            for m in pat.finditer(body):
+                s, en = m.span()
+                if any(s < ce and en > cs for cs, ce in consumed):
+                    continue
+                consumed.append((s, en))
+                c += 1
+            counts[opt] = c
         for opt in translations:
-            counts[opt] = _count_option(body, opt)
+            if opt not in counts:
+                counts[opt] = 0
         total = sum(counts.values())
         # Mixing allowed: valid iff total matches occurrences
         if total != exp:
             violations.append(f"{e.get('term_he')!r}→{translations!r} expected {exp}× got total {total}× counts={counts}")
             continue
-    # Order check (only if no count violations)
+    # Order check (only if no count violations) — first-mention order per term
     if not violations and len(term_map) > 1:
         positions: list[str] = []
+        pos_values: list[int] = []
         for e in sorted(term_map, key=lambda x: x.get("src_order", 0)):
             if e.get("keep_source"):
                 target = e.get("term_he", "") or ""
-                pos = body.find(target) if target else None
-                if pos is not None and pos != -1:
-                    positions.append(target)
-                    continue
+                pp = body.find(target) if target else -1
                 positions.append(target)
+                pos_values.append(pp if pp != -1 else 10**9)
                 continue
             translations = _filter_translations(e.get("translations"))
-            # Find which option was used (the one with count > 0)
-            used = None
+            best_pos = None
+            best_opt = ""
             for opt in translations:
-                if _count_option(body, opt) > 0:
-                    used = opt
-                    break
-            ordered_opt = used or (translations[0] if translations else "")
-            positions.append(ordered_opt)
-        oo = verify_ordered(positions, body)
-        if oo:
-            violations.append(f"out of order: {oo}")
+                pp = _first_pos_of_option(body, opt)
+                if pp is not None and (best_pos is None or pp < best_pos):
+                    best_pos = pp
+                    best_opt = opt
+            positions.append(best_opt or (translations[0] if translations else ""))
+            pos_values.append(best_pos if best_pos is not None else 10**9)
+        out = []
+        for k in range(1, len(pos_values)):
+            if pos_values[k] != 10**9 and pos_values[k-1] != 10**9 and pos_values[k] < pos_values[k-1]:
+                out.append(positions[k])
+        if out:
+            violations.append(f"out of order: {out}")
     return {"check": "glossary_translations", "status": "fail" if violations else "pass", "violations": violations}
 
 
