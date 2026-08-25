@@ -15,12 +15,12 @@ Thresholds (pre-calibration placeholders, fit from Phase-0 references):
 CLI:
   python scripts/translation_qa.py <store_dir> [--glossary PATH] [--vault-root PATH] [--json-out PATH]
   store_dir positional: data/translations root (content-addressed <sha>/translation.md)
-  --glossary PATH       glossary.csv (optional, enables glossary_retention)
+  --glossary PATH       glossary.json (optional, enables glossary_retention)
   --vault-root PATH     vault root for locating source docs and person_names allowlist
   --json-out PATH       write aggregated JSON array [{file, meta, checks}] per doc
 
 Usage example:
-  python scripts/translation_qa.py data/translations --glossary data/domain_terms/glossary.csv --json-out qa.json
+  python scripts/translation_qa.py data/translations --glossary data/domain_terms/glossary.json --json-out qa.json
 
 Reads content-addressed store data/translations/<sha>/translation.md.
 """
@@ -32,6 +32,21 @@ import json
 import re
 import sys
 from pathlib import Path
+
+
+try:
+    from .translation_common import _valid_translation_option, _filter_translations  # DRY
+    _HAS_COMMON_FILTER = True
+except ImportError:
+    try:
+        from translation_common import _valid_translation_option, _filter_translations
+        _HAS_COMMON_FILTER = True
+    except ImportError:
+        _HAS_COMMON_FILTER = False
+        def _valid_translation_option(t: str) -> bool:
+            return bool(t and t.strip())
+        def _filter_translations(raw):
+            return [str(o).strip() for o in (raw or []) if str(o).strip()]
 
 # Shared helpers (deduped) — translation_common is single source of truth
 try:
@@ -150,7 +165,7 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
 
     Codename-aware: org codenames that collide with Hebrew names are removed
     so they are not suppressed. Primary source is the domain glossary
-    (data/domain_terms/glossary.csv — term_he with status approved/keep_source);
+    (data/domain_terms/glossary.json — term_he with status approved/keep_source);
     an optional data/person_names/codenames.txt is also read for manual overrides.
     """
     import csv
@@ -163,14 +178,14 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
         candidates.append(vault_root / "data" / "person_names" / "first_names.txt")
         candidates.append(vault_root / "data" / "person_names" / "last_names_ranked.txt")
         codename_candidates.append(vault_root / "data" / "person_names" / "codenames.txt")
-        glossary_candidates.append(vault_root / "data" / "domain_terms" / "glossary.csv")
+        glossary_candidates.append(vault_root / "data" / "domain_terms" / "glossary.json")
     else:
         cur = Path.cwd().resolve()
         for p in [cur] + list(cur.parents):
             candidates.append(p / "data" / "person_names" / "first_names.txt")
             candidates.append(p / "data" / "person_names" / "last_names_ranked.txt")
             codename_candidates.append(p / "data" / "person_names" / "codenames.txt")
-            glossary_candidates.append(p / "data" / "domain_terms" / "glossary.csv")
+            glossary_candidates.append(p / "data" / "domain_terms" / "glossary.json")
     for p in candidates:
         if p.exists():
             try:
@@ -195,16 +210,15 @@ def _load_person_names_for_qa(vault_root: Path | None) -> set[str]:
     for gp in glossary_candidates:
         if gp.exists():
             try:
-                text = gp.read_text(encoding="utf-8")
-                lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
-                if lines:
-                    reader = csv.DictReader(lines)
-                    for row in reader:
-                        term = (row.get("term_he") or "").strip()
-                        status = (row.get("status") or "").strip()
-                        if term and status in ("approved", "keep_source"):
-                            codenames.add(term)
-            except OSError:
+                rows = json.loads(gp.read_text(encoding="utf-8"))
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    term = (row.get("term_he") or "").strip()
+                    status = (row.get("status") or "").strip()
+                    if term and status in ("approved", "keep_source"):
+                        codenames.add(term)
+            except (OSError, json.JSONDecodeError):
                 pass
             break  # only first found glossary
     if codenames:
@@ -284,7 +298,7 @@ def check_untranslated_block(body: str) -> dict:
 def check_glossary_retention(body: str, glossary: list[dict]) -> dict:
     violations = []
     for row in glossary:
-        eng = (row.get("english") or "").strip()
+        translations = _filter_translations(row.get("translations"))
         status = (row.get("status") or "").strip()
         term_he = (row.get("term_he") or "").strip()
         if status not in ("approved", "keep_source"):
@@ -293,13 +307,10 @@ def check_glossary_retention(body: str, glossary: list[dict]) -> dict:
             if term_he and term_he not in body:
                 violations.append(f"keep_source missing: {term_he!r}")
         elif status == "approved":
-            if not eng:
+            if not translations:
                 continue
-            # Approved term: translation body must contain the English rendering
-            # or an explicit ⟦he:term_he⟧ marker signalling blocked translation.
-            if eng in body:
+            if any(_count_option(body, opt) > 0 for opt in translations):
                 continue
-            # Marker check: multi-word terms are marked per-word
             if " " in term_he:
                 tokens = term_he.split()
                 per_word = all(f"⟦he:{tok}⟧" in body for tok in tokens)
@@ -309,7 +320,7 @@ def check_glossary_retention(body: str, glossary: list[dict]) -> dict:
             else:
                 if f"⟦he:{term_he}⟧" in body:
                     continue
-            violations.append(f"approved term {term_he!r} -> {eng!r} not found in translation")
+            violations.append(f"approved term {term_he!r} -> {translations!r} not found in translation")
     return {
         "check": "glossary_retention",
         "status": "fail" if violations else "pass",
@@ -333,58 +344,69 @@ def verify_ordered(source_items: list[str], translation: str) -> list[str]:
     return out
 
 
-def check_glossary_sentinel(body: str, term_map: list[dict]) -> dict:
-    from .translation_common import build_glossary_sentinel, build_keep_sentinel
-
-    violations: list[str] = []
-    for e in term_map:
-        if e.get("keep_source"):
-            sentinel = build_keep_sentinel(e["term_he"])
-        else:
-            sentinel = build_glossary_sentinel(e["id"], e["english"])
-        have = body.count(sentinel)
-        exp = e.get("occurrences", 1)
-        if have != exp:
-            violations.append(f"{e.get('term_he')!r}→{sentinel!r} expected {exp}× got {have}×")
-    # order check via verify_ordered over sentinel strings in src order
-    if not violations and len(term_map) > 1:
-        ordered: list[str] = []
-        for e in sorted(term_map, key=lambda x: x.get("src_order", x["id"])):
-            s = build_keep_sentinel(e["term_he"]) if e.get("keep_source") else build_glossary_sentinel(e["id"], e["english"])
-            ordered.append(s)
-        oo = verify_ordered(ordered, body)
-        if oo:
-            violations.append(f"out of order: {oo}")
-    return {"check": "glossary_sentinel", "status": "fail" if violations else "pass", "violations": violations}
+def _count_option(body: str, option: str) -> int:
+    """Count occurrences of option in body with simple word boundaries."""
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(option) + r"(?![A-Za-z0-9_])")
+    return len(pat.findall(body))
 
 
-def check_glossary_post_unmask(body: str, term_map: list[dict]) -> dict:
-    """Doc-level check on unmasked body: English/keep_source occurrences must match term_map.
+def _first_pos_of_option(body: str, option: str) -> int | None:
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(option) + r"(?![A-Za-z0-9_])")
+    m = pat.search(body)
+    return m.start() if m else None
 
-    Used when body no longer contains sentinels (after unmask). Mirrors sentinel counts
-    but on the final English/keep_source strings with exact count + order.
-    Note: uses substring count (str.count); assumes glossary English terms are distinct
-    (no term is a substring of another, e.g. "API" vs "API gateway" would over-count).
-    Collisions/overlaps are gated by check_glossary_collisions; sentinel check is exact.
+
+def check_glossary_translations(body: str, term_map: list[dict]) -> dict:
+    """Plain-text glossary check: each term must use allowed translations with correct total.
+
+    - For keep_source: term_he must appear in body.
+    - For approved: any mix of allowed translations that sums to occurrences is valid; mixing is allowed.
+    - Invalid options (parenthetical notes etc.) are discarded before checking.
     """
     violations: list[str] = []
     for e in term_map:
-        target = e["term_he"] if e.get("keep_source") else (e.get("english") or "")
-        if not target:
+        if e.get("keep_source"):
+            term_he = e.get("term_he", "") or ""
+            if term_he and term_he not in body:
+                violations.append(f"keep_source missing: {term_he!r}")
             continue
-        have = body.count(target)
+        translations = _filter_translations(e.get("translations"))
+        if not translations:
+            continue
         exp = int(e.get("occurrences", 1))
-        if have != exp:
-            violations.append(f"{e.get('term_he')!r}→{target!r} expected {exp}× got {have}×")
+        counts: dict[str, int] = {}
+        for opt in translations:
+            counts[opt] = _count_option(body, opt)
+        total = sum(counts.values())
+        # Mixing allowed: valid iff total matches occurrences
+        if total != exp:
+            violations.append(f"{e.get('term_he')!r}→{translations!r} expected {exp}× got total {total}× counts={counts}")
+            continue
+    # Order check (only if no count violations)
     if not violations and len(term_map) > 1:
-        ordered: list[str] = []
-        for e in sorted(term_map, key=lambda x: x.get("src_order", x["id"])):
-            t = e["term_he"] if e.get("keep_source") else (e.get("english") or "")
-            ordered.append(t)
-        oo = verify_ordered(ordered, body)
+        positions: list[str] = []
+        for e in sorted(term_map, key=lambda x: x.get("src_order", 0)):
+            if e.get("keep_source"):
+                target = e.get("term_he", "") or ""
+                pos = body.find(target) if target else None
+                if pos is not None and pos != -1:
+                    positions.append(target)
+                    continue
+                positions.append(target)
+                continue
+            translations = _filter_translations(e.get("translations"))
+            # Find which option was used (the one with count > 0)
+            used = None
+            for opt in translations:
+                if _count_option(body, opt) > 0:
+                    used = opt
+                    break
+            ordered_opt = used or (translations[0] if translations else "")
+            positions.append(ordered_opt)
+        oo = verify_ordered(positions, body)
         if oo:
             violations.append(f"out of order: {oo}")
-    return {"check": "glossary_sentinel", "status": "fail" if violations else "pass", "violations": violations}
+    return {"check": "glossary_translations", "status": "fail" if violations else "pass", "violations": violations}
 
 
 def check_heading_fidelity(source_body: str, trans_body: str) -> dict:
@@ -491,20 +513,17 @@ def check_preserved_invariants(source_body: str, trans_body: str, vault_root: Pa
             # Glossary-aware: codenames (domain terms) are excluded from PERSON guard
             # so a correctly translated codename does not trigger a false missing-person failure.
             try:
-                import csv as _csv
-
-                glossary_path = vault_root / "data" / "domain_terms" / "glossary.csv"
+                glossary_path = vault_root / "data" / "domain_terms" / "glossary.json"
                 glossary_terms: set[str] = set()
                 if glossary_path.exists():
-                    text = glossary_path.read_text(encoding="utf-8")
-                    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
-                    if lines:
-                        reader = _csv.DictReader(lines)
-                        for row in reader:
-                            term = (row.get("term_he") or "").strip()
-                            status = (row.get("status") or "").strip()
-                            if term and status in ("approved", "keep_source"):
-                                glossary_terms.add(term)
+                    rows = json.loads(glossary_path.read_text(encoding="utf-8"))
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        term = (row.get("term_he") or "").strip()
+                        status = (row.get("status") or "").strip()
+                        if term and status in ("approved", "keep_source"):
+                            glossary_terms.add(term)
                 first, last = tmod.load_person_names(vault_root, exclude=glossary_terms)
             except Exception:
                 first, last = tmod.load_person_names(vault_root)
@@ -571,16 +590,11 @@ def run_all(source_path: Path | None, trans_body: str, trans_meta: dict, glossar
     checks: list[dict] = []
     checks.append(check_residual_hebrew(trans_body, vault_root=vault_root))
     checks.append(check_untranslated_block(trans_body))
-    # Sentinel path replaces glossary_retention when term_map available.
-    # Pre-unmask body contains sentinels (⟦EN:/⟦KEEP:); post-unmask body contains English.
-    # Dispatch accordingly so doc-level QA gates correctly in both cases.
     if term_map is not None:
-        if "⟦EN:" in trans_body or "⟦KEEP:" in trans_body:
-            checks.append(check_glossary_sentinel(trans_body, term_map))
-        elif term_map:
-            checks.append(check_glossary_post_unmask(trans_body, term_map))
+        if term_map:
+            checks.append(check_glossary_translations(trans_body, term_map))
         else:
-            checks.append({"check": "glossary_sentinel", "status": "pass", "violations": []})
+            checks.append({"check": "glossary_translations", "status": "pass", "violations": []})
     else:
         checks.append(check_glossary_retention(trans_body, glossary))
     if source_body or raw_source:
@@ -613,7 +627,7 @@ run_all_checks = run_all
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Deterministic QA gate for translations")
     ap.add_argument("store_dir", type=Path, help="data/translations root")
-    ap.add_argument("--glossary", type=Path, default=None, help="glossary.csv")
+    ap.add_argument("--glossary", type=Path, default=None, help="glossary.json")
     ap.add_argument("--vault-root", type=Path, default=None, help="vault root for locating source docs and person_names allowlist")
     ap.add_argument("--json-out", type=Path, default=None, help="write aggregated JSON array with {file, meta, checks} per doc")
     args = ap.parse_args(argv)
@@ -639,11 +653,17 @@ def main(argv=None):
     glossary: list[dict] = []
     if args.glossary and Path(args.glossary).exists():
         gp = Path(args.glossary)
-        lines = _read_csv_skip_comments(gp)
-        if lines:
-            reader = csv.DictReader(lines)
-            if reader.fieldnames:
-                glossary = list(reader)
+        if gp.suffix == ".json":
+            try:
+                glossary = json.loads(gp.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                glossary = []
+        else:
+            lines = _read_csv_skip_comments(gp)
+            if lines:
+                reader = csv.DictReader(lines)
+                if reader.fieldnames:
+                    glossary = list(reader)
 
     translations = sorted(store_dir.rglob("translation.md"))
     if not translations:

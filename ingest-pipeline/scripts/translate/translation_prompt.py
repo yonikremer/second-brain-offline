@@ -4,57 +4,59 @@ from __future__ import annotations
 import json
 import re
 
+from .translation_common import _valid_translation_option, _filter_translations
 from .translation_chunking import chunk_markdown, glossary_for_chunk
 from .translation_invariants import extract_preservation_invariants
 
 
+
+
+
+
 def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
-                 prev_tail: str = "", invariants: dict | None = None, term_map: list[dict] | None = None) -> str:
-    # Sentinel contract (Task 3): when term_map provided, render Pre-translated block instead of glossary_block
+                 prev_tail: str = "", invariants: dict | None = None, term_map: list[dict] | None = None,
+                 previous_choices: dict[str, str] | None = None) -> str:
     glossary_block = ""
-    sentinel_block = ""
     if term_map is not None:
         if term_map:
             lines: list[str] = []
             for e in term_map:
                 term_he = e.get("term_he", "") or ""
-                eng = e.get("english", "") or ""
+                translations = _filter_translations(e.get("translations"))
                 occ = e.get("occurrences", 1)
                 keep = e.get("keep_source", False)
                 is_keep = keep is True or keep == 1 or str(keep) == "1"
                 if is_keep:
-                    from .translation_common import build_keep_sentinel
-                    sentinel = build_keep_sentinel(term_he)
-                    lines.append(f"  - {sentinel} ← {term_he} (keep as Hebrew, appears {occ}×)")
-                else:
-                    from .translation_common import build_glossary_sentinel
-                    tid = e.get("id", 0)
-                    try:
-                        tid_int = int(tid)
-                    except Exception:
-                        tid_int = 0
-                    sentinel = build_glossary_sentinel(tid_int, eng)
-                    lines.append(f"  - {sentinel} ← {term_he} (appears {occ}×)")
-            sentinel_block = "Pre-translated terms in this chunk:\n" + "\n".join(lines) + "\n\n"
+                    lines.append(f"  [{term_he}:KEEP as Hebrew] (appears {occ}×)")
+                elif translations:
+                    opts = "|".join(translations)
+                    lines.append(f"  [{term_he}:{opts}] (appears {occ}×)")
+            if lines:
+                glossary_block = "Glossary — for each Hebrew term, use exactly one of the allowed translations:\n" + "\n".join(lines) + "\n\n"
     elif glossary_rows:
         lines = []
         for r in glossary_rows:
             term = r.get("term_he", "")
-            eng = r.get("english", "")
+            translations = _filter_translations(r.get("translations"))
             ks = r.get("keep_source", "0")
-            if ks == "1":
-                lines.append(f"- {term} → KEEP AS-IS (do not translate)")
-            elif eng:
-                lines.append(f"- {term} → {eng}")
-            else:
-                lines.append(f"- {term} → (translate per context)")
-        glossary_block = "Glossary (use these exact renderings):\n" + "\n".join(lines) + "\n\n"
+            is_keep = ks == "1" or ks is True or str(ks) == "1" or r.get("status") == "keep_source"
+            if is_keep:
+                lines.append(f"[{term}:KEEP as Hebrew]")
+            elif translations:
+                opts = "|".join(translations)
+                lines.append(f"[{term}:{opts}]")
+            # invalid-only terms are dropped entirely — do not emit "translate per context"
+        if lines:
+            glossary_block = "Glossary — for each Hebrew term, use exactly one of the allowed translations:\n" + "\n".join(f"  {l}" for l in lines) + "\n\n"
 
     prev_block = ""
     if prev_tail:
         prev_block = f"Previous chunk tail (context only, do not re-emit):\n{prev_tail[:800]}\n\n"
 
-    # Preservation context: invariants the LLM sees verbatim and must copy exactly
+    # previous_choices is kept for back-compat but ignored (mixing allowed — no consistency block emitted)
+    _ = previous_choices
+
+    # Preservation context
     preserve_block = ""
     if invariants:
         parts: list[str] = []
@@ -65,9 +67,7 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
                            ("urls_and_paths", "URLs/file-paths (keep verbatim, in order)")]:
             items = invariants.get(cat) or []
             if items:
-                # Cap to keep prompt small; full list still verified after
                 shown = items[:30]
-                # For yaml/code, trim long blocks for prompt but verification uses full value
                 def _short(s: str) -> str:
                     return s[:300] + ("…(truncated)" if len(s) > 300 else "")
                 shown_short = [_short(s) for s in shown]
@@ -77,37 +77,20 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
         if parts:
             preserve_block = "Preserve verbatim IN ORDER — these strings from the source MUST appear exactly and in the same relative order in the output (code/YAML frontmatter included):\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
 
-    # Rules diverge for sentinel vs legacy glossary mode (preserve_block unchanged per task)
-    if term_map is not None:
-        rules_block = (
-            f"Translate this Hebrew markdown chunk to faithful technical English.\n"
-            f"Rules:\n"
-            f"- Preserve headings, lists, tables, code fences exactly (same counts) and in the same order.\n"
-            f"- Blocks of the form ⟦EN:{{id}}:{{English}}⟧ are pre-translated glossary terms — copy them VERBATIM including the ⟦EN: and ⟧ delimiters, do not translate, inflect, or reorder their interior English. Translate the surrounding Hebrew particles as normal English prepositions/pronouns.\n"
-            f"- Blocks ⟦KEEP:{{Hebrew}}⟧ must be copied verbatim as Hebrew.\n"
-            f"- Person names, English/URLs/code/YAML listed below must be copied verbatim and kept in the same relative order as in the source — do not translate, transliterate, reorder, or alter them.\n"
-            f"- Never invent translations for unknown terms — list them in unknown_terms and emit ⟦he:term⟧.\n"
-            f"- Output JSON: {{\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}}\n\n"
-        )
-        term_block_to_emit = sentinel_block
-        glossary_to_emit = ""
-    else:
-        rules_block = (
-            f"Translate this Hebrew markdown chunk to faithful technical English.\n"
-            f"Rules:\n"
-            f"- Preserve headings, lists, tables, code fences exactly (same counts) and in the same order.\n"
-            f"- Use glossary renderings exactly where they appear.\n"
-            f"- Person names, English/URLs/code/YAML listed below must be copied verbatim and kept in the same relative order as in the source — do not translate, transliterate, reorder, or alter them.\n"
-            f"- Never invent translations for unknown terms — list them in unknown_terms.\n"
-            f"- Output JSON: {{\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}}\n\n"
-        )
-        term_block_to_emit = ""
-        glossary_to_emit = glossary_block
+    rules_block = (
+        f"Translate this Hebrew markdown chunk to faithful technical English.\n"
+        f"Rules:\n"
+        f"- For each glossary term listed above, use exactly one of its allowed translations. Do not invent alternatives.\n"
+        f"- Choose the translation that best fits the surrounding context; you may use different allowed renderings for different occurrences.\n"
+        f"- Preserve headings, lists, tables, code fences exactly (same counts) and in the same order.\n"
+        f"- Person names, English/URLs/code/YAML listed below must be copied verbatim and kept in the same relative order — do not translate, transliterate, reorder, or alter them.\n"
+        f"- Never invent translations for unknown terms — list them in unknown_terms and emit ⟦he:term⟧.\n"
+        f"- Output JSON: {{\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}}\n\n"
+    )
 
     return (
         f"{rules_block}"
-        f"{term_block_to_emit}"
-        f"{glossary_to_emit}"
+        f"{glossary_block}"
         f"{preserve_block}"
         f"{prev_block}"
         f"Section: {section_path}\n\n"
@@ -122,7 +105,8 @@ def format_qa_failures(checks: list[dict]) -> list[dict]:
 
 def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dict],
                      glossary_rows: list[dict] | None = None,
-                     invariants: dict | None = None, term_map: list[dict] | None = None) -> str:
+                     invariants: dict | None = None, term_map: list[dict] | None = None,
+                     previous_choices: dict[str, str] | None = None) -> str:
     """Prompt for LLM to repair previous translation given QA failures."""
     src_cap = source_text[:12000]
     if len(source_text) > 12000:
@@ -140,25 +124,17 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
             lines: list[str] = []
             for e in term_map[:20]:
                 term_he = e.get("term_he", "") or ""
-                eng = e.get("english", "") or ""
+                translations = _filter_translations(e.get("translations"))
                 occ = e.get("occurrences", 1)
                 keep = e.get("keep_source", False)
                 is_keep = keep is True or keep == 1 or str(keep) == "1"
                 if is_keep:
-                    from .translation_common import build_keep_sentinel
-                    sentinel = build_keep_sentinel(term_he)
-                    lines.append(f"  - {sentinel} ← {term_he} (keep as Hebrew, appears {occ}×)")
-                else:
-                    from .translation_common import build_glossary_sentinel
-                    tid = e.get("id", 0)
-                    try:
-                        tid_int = int(tid)
-                    except Exception:
-                        tid_int = 0
-                    sentinel = build_glossary_sentinel(tid_int, eng)
-                    lines.append(f"  - {sentinel} ← {term_he} (appears {occ}×)")
+                    lines.append(f"  [{term_he}:KEEP as Hebrew] (appears {occ}×)")
+                elif translations:
+                    opts = "|".join(translations)
+                    lines.append(f"  [{term_he}:{opts}] (appears {occ}×)")
             if lines:
-                glossary_block = "Pre-translated terms in this chunk (fix — copy VERBATIM):\n" + "\n".join(lines)
+                glossary_block = "Glossary (use one of the allowed translations):\n" + "\n".join(lines)
                 if len(term_map) > 20:
                     glossary_block += f"\n(+{len(term_map) - 20} more)"
                 glossary_block += "\n\n"
@@ -166,14 +142,17 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
         lines = []
         for r in glossary_rows[:20]:
             term = r.get("term_he", "")
-            eng = r.get("english", "")
-            if term and eng:
-                lines.append(f"- {term} → {eng}")
+            translations = _filter_translations(r.get("translations"))
+            if term and translations:
+                opts = "|".join(translations)
+                lines.append(f"[{term}:{opts}]")
         if lines:
-            glossary_block = "Glossary (must use exactly):\n" + "\n".join(lines)
+            glossary_block = "Glossary (must use exactly one of the allowed):\n" + "\n".join(lines)
             if glossary_rows and len(glossary_rows) > 20:
                 glossary_block += f"\n(+{len(glossary_rows) - 20} more)"
             glossary_block += "\n\n"
+    # previous_choices is kept for back-compat but ignored (mixing allowed)
+    _ = previous_choices
     invariants_block = ""
     if invariants:
         parts = []
@@ -190,8 +169,9 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
         "You are repairing a Hebrew→English markdown translation that FAILED scripted QA checks.\n"
         "Fix ONLY the reported failures. Keep everything else identical.\n"
         "Rules:\n"
+        "- For each glossary term, use exactly one of its allowed translations — do not invent alternatives.\n"
+        "- Choose the translation that best fits the surrounding context; you may use different allowed renderings for different occurrences.\n"
         "- Preserve headings, lists, tables, code fences exactly (same counts) and in order.\n"
-        "- Use glossary renderings exactly where they appear.\n"
         "- Person names, English/URLs/code/YAML below must be copied verbatim and in order.\n"
         "- Never invent translations for unknown terms — use ⟦he:term⟧ and list in unknown_terms.\n"
         "- Output JSON: {\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}\n\n"
@@ -206,8 +186,12 @@ def build_fix_prompt(source_text: str, prev_translation: str, failures: list[dic
 def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures: list[dict],
                                glossary_rows: list[dict] | None, invariants: dict | None,
                                chunk_chars: int,
-                               first_names: set[str] | None = None, last_names: set[str] | None = None) -> list[str]:
-    """Split large-doc fix into per-chunk prompts to avoid 12k truncation loss."""
+                               first_names: set[str] | None = None, last_names: set[str] | None = None,
+                               previous_choices: dict[str, str] | None = None) -> list[str]:
+    """Split large-doc fix into per-chunk prompts to avoid 12k truncation loss.
+
+    previous_choices is kept for back-compat but is a no-op (mixing allowed).
+    """
     src_chunks = chunk_markdown(source_text, max_chars=chunk_chars)
     prev_chunks = chunk_markdown(prev_translation, max_chars=chunk_chars) if prev_translation.strip() else []
     n = max(len(src_chunks), len(prev_chunks), 1)
@@ -232,7 +216,7 @@ def _build_chunked_fix_prompts(source_text: str, prev_translation: str, failures
             chunk_invariants = invariants
             if chunk_glossary is None:
                 chunk_glossary = glossary_rows
-        p = build_fix_prompt(src, prev, failures, chunk_glossary, chunk_invariants)
+        p = build_fix_prompt(src, prev, failures, chunk_glossary, chunk_invariants, previous_choices=previous_choices)
         # Annotate that failures are global — model should only fix those affecting its chunk
         global_note = "Note: QA failures above are global for the whole document — fix only those that affect your chunk's section, keep rest identical.\n\n"
         p = f"Chunk {i+1}/{n} — Section: {section}\n{global_note}" + p

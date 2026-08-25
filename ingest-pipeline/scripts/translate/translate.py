@@ -19,16 +19,16 @@
 Config: convert_config.json translation block:
   translation {base_url (\"\"), reviewer_base_url (\"\"), api_key_env (TRANSLATE_API_KEY),
                model (minimax-m2.7), reviewer_model (kimi-k2.7), chunk_chars (6000),
-               review_sample (0.2), glossary_path (data/domain_terms/glossary.csv),
+               review_sample (0.2), glossary_path (data/domain_terms/glossary.json),
                fix_rounds (3), chunk_retries (2)}
   Defaults: base_url \"\", reviewer_base_url \"\", chunk_chars 6000, review_sample 0.2,
-            glossary_path data/domain_terms/glossary.csv, fix_rounds 3, model minimax-m2.7,
+            glossary_path data/domain_terms/glossary.json, fix_rounds 3, model minimax-m2.7,
             reviewer_model kimi-k2.7, api_key_env TRANSLATE_API_KEY.
   Env precedence: TRANSLATE_BASE_URL primary, QMD_OPENAI_BASE_URL fallback;
   reviewer uses TRANSLATE_REVIEWER_BASE_URL override (see translation_reviewer.py).
   fix_rounds precedence: CLI --fix-rounds > TRANSLATE_FIX_ROUNDS env > config > 3 (0=disable).
   chunk_retries precedence: CLI --chunk-retries > TRANSLATE_CHUNK_RETRIES env > config > 2
-    (0=disable). Retries cover model non-compliance (lost sentinel or lost segment/cell
+    (0=disable). Retries cover model non-compliance (lost segment/cell
     delimiter) only; environment faults such as a missing YAP stay fail-closed.
 Fail-fast if base_url missing. --mock for CI (mock is PERSON-sentinel aware: splits by
   ⟦PERSON_n⟧, only wraps remaining [א-ת]{2,} as ⟦he:…⟧ so sentinels are not marked).
@@ -39,23 +39,20 @@ CLI:
                               [--chunk-retries N]
   vault_root positional (default ".")
   --input DIR     corpus dir (default raw_md/raw auto-detect)
-  --glossary PATH glossary.csv override (default translation.glossary_path or vault/data/domain_terms/glossary.csv)
+  --glossary PATH glossary.json override (default translation.glossary_path or vault/data/domain_terms/glossary.json)
   --out DIR       output store dir (default vault/data/translations, canonical ledger vault/data/translations/ledger.jsonl)
   --check         only check glossary gate, exit 1 if blocked
-  --mock          offline mock (glossary substitution + sentinel-aware Hebrew marking)
+  --mock          offline mock (Hebrew marking outside invariants)
   --force         retranslate even if cached (ignores both the document store and
                   the chunk checkpoints)
   --resume        same as default (resume by hash, kept for docs compat)
   --limit N       limit files (0=all)
   --fix-rounds N  max LLM fix rounds per doc after QA failures (default 3, 0=disable, env TRANSLATE_FIX_ROUNDS overrides config)
-  --chunk-retries N  retries per chunk on sentinel/delimiter loss (default 2, 0=disable)
+  --chunk-retries N  retries per chunk on delimiter loss (default 2, 0=disable)
 """
 from __future__ import annotations
 
 import argparse
-import csv
-from .translation_common import read_csv_lines_skip_comments as _shared_read_csv
-_HAS_SHARED = True
 import hashlib
 import json
 import os
@@ -183,23 +180,22 @@ def resolve_corpus_dir(vault_root: Path, explicit: Path | None = None) -> Path:
 
 
 def _read_csv_skip_comments(path: Path) -> list[str]:
-    """Read CSV text stripping # comment and empty lines (matches check_glossary) — via translation_common."""
-    if _HAS_SHARED:
-        return _shared_read_csv(path)
-    text = path.read_text(encoding="utf-8")
-    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    """Deprecated: CSV helper kept for compat — glossary is now JSON."""
+    return []
 
 
 def load_glossary(glossary_path: Path) -> list[dict]:
     if not glossary_path.exists():
         return []
-    lines = _read_csv_skip_comments(glossary_path)
-    if not lines:
-        return []
-    reader = csv.DictReader(lines)
-    if not reader.fieldnames:
-        return []
-    return list(reader)
+    if glossary_path.suffix != ".json":
+        raise RuntimeError(f"glossary must be .json, got {glossary_path.suffix}: {glossary_path}")
+    try:
+        rows = json.loads(glossary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"cannot read glossary: {e}") from e
+    if not isinstance(rows, list):
+        raise RuntimeError("glossary must be a JSON array")
+    return rows
 
 
 # Person-name helpers — single source in translation_common.py (fail-closed)
@@ -212,8 +208,13 @@ from .translation_chunking import chunk_markdown, glossary_for_chunk
 from .translation_masking import (
     HEBREW_RANGE, PROCLITICS, RAW_WORD_RE, MIXED_SPLIT_RE,
     _require_yap, _heuristic_split, _roots_for_token, _analyze_with_fallback,
-    mask_glossary_terms, unmask_glossary_terms,
+    detect_glossary_terms,
 )
+# Compat aliases — old masking API removed, glossary is prompt-only
+def mask_glossary_terms(chunk_text: str, glossary_rows: list[dict]) -> tuple[str, list[dict]]:  # type: ignore[misc]
+    return chunk_text, detect_glossary_terms(chunk_text, glossary_rows)
+def unmask_glossary_terms(text: str, term_map: list[dict]) -> str:  # type: ignore[misc]
+    return text
 from . import translation_masking as _masking
 _YAP_AVAILABLE = _masking._YAP_AVAILABLE
 
@@ -238,10 +239,9 @@ def __getattr__(name):  # PEP 562
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-from .translation_llm import call_llm, mock_translate, _mock_with_sentinels
+from .translation_llm import call_llm, mock_translate
 
 from .translation_prompt import build_prompt, build_fix_prompt, _build_chunked_fix_prompts, format_qa_failures
-from .translation_qa import check_glossary_sentinel
 from . import translation_qa as qa_mod
 from .translation_common import compute_glossary_version as _compute_gv
 
@@ -251,7 +251,7 @@ def run_qa_for_doc(source_path: Path, trans_body: str, trans_meta: dict,
                    term_map: list[dict] | None = None) -> list[dict]:
     """Run scripted QA battery; returns list of check dicts. Falls back gracefully.
 
-    term_map is threaded explicitly so document-level sentinel check gates the doc.
+    term_map is threaded explicitly so document-level glossary check gates the doc.
     If term_map is None, falls back to trans_meta.get("term_map") for compat.
     """
     try:
@@ -283,54 +283,55 @@ def _glossary_fingerprint(glossary: list[dict]) -> str:
     """Stable digest of the glossary rows that can affect a translation.
 
     Part of the chunk checkpoint key: editing the glossary must invalidate every
-    cached chunk, because masking and the injected term list both change.
+    cached chunk, because the injected term list changes.
     """
-    # NOT sorted: mask_glossary_terms assigns sentinel ids positionally
-    # (gid = len(glossary_entries)), so those ids reach the prompt, the ledger
-    # term_map, and — when two rows share a YAP root — which English wins.
-    rows = [
-        (str(r.get("term_he", "")), str(r.get("english", "")),
+    rows = sorted([
+        (str(r.get("term_he", "")), tuple(sorted(str(o) for o in (r.get("translations") or []))),
          str(r.get("keep_source", "")), str(r.get("status", "")))
         for r in glossary
-    ]
+    ], key=lambda x: x[0])
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
 # Chunk failures the model can plausibly get right on a second attempt. Everything
 # else (missing YAP, missing md_mask) is an environment fault where retrying just
 # burns LLM budget and hides the real cause, so it stays fail-closed.
-_RETRYABLE_CHUNK_ERRORS = ("sentinel lost", "Segment count mismatch", "Cell count mismatch")
+_RETRYABLE_CHUNK_ERRORS = ("Segment count mismatch", "Cell count mismatch")
 
 
 def _is_retryable_chunk_error(exc: Exception) -> bool:
     return any(m in str(exc) for m in _RETRYABLE_CHUNK_ERRORS)
 
 
+def _count_option(body: str, option: str) -> int:
+    """Word-boundary count for glossary option in translated body."""
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(option) + r"(?![A-Za-z0-9_])")
+    return len(pat.findall(body))
+
+
 def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
                          first_names: set[str], last_names: set[str],
                          glossary: list[dict], base_url: str, api_key: str,
-                         model: str, mock: bool, no_mask: bool) -> dict:
+                         model: str, mock: bool, no_mask: bool,
+                         previous_choices: dict[str, str] | None = None) -> dict:
     """Translate exactly one chunk. Returns a JSON-serialisable checkpoint payload.
 
-    Raises RuntimeError on sentinel loss or delimiter loss — scoped to this chunk,
+    Raises RuntimeError on delimiter loss — scoped to this chunk,
     so the caller can retry it instead of losing the document.
     """
     chunk_unknown: list[str] = []
     invariants = extract_preservation_invariants(chunk_text, first_names, last_names)
     g_rows = glossary_for_chunk(chunk_text, glossary)
-    # Deterministic masking: use full approved glossary to catch inflected forms (הDBים, המערכות)
-    approved_for_mask = [r for r in glossary if (r.get("status") or "approved").strip() in ("approved", "keep_source") and (r.get("term_he") or "").strip()]
+    # Deterministic detection: use full approved glossary to catch inflected forms (הDBים, המערכות)
+    detect_rows = [r for r in glossary if (r.get("status") or "approved").strip() in ("approved", "keep_source") and (r.get("term_he") or "").strip()]
     chunk_term_map: list[dict] = []
-    masked_chunk = chunk_text
-    if approved_for_mask:
+    if detect_rows:
         try:
-            # Cross-chunk aggregation happens in the caller, which sees cached
-            # chunks too; this function only reports what this chunk contained.
-            masked_chunk, chunk_term_map = mask_glossary_terms(chunk_text, approved_for_mask)
+            chunk_term_map = detect_glossary_terms(chunk_text, detect_rows)
         except RuntimeError:
             raise
         except FileNotFoundError as e:
-            raise RuntimeError(f"YAP required for glossary masking — fail-closed: {e}") from e
+            raise RuntimeError(f"YAP required for glossary detection — fail-closed: {e}") from e
     use_mask = not no_mask
     if use_mask and md_mask is None:
         raise RuntimeError("md_mask missing — restore scripts/md_mask.py (table/placeholder masking required)")
@@ -341,7 +342,7 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
             translate_latex=False,
             translate_link_text=True,
         )
-        filt = md_mask.filter_markdown_lines(masked_chunk.split("\n"), opts)
+        filt = md_mask.filter_markdown_lines(chunk_text.split("\n"), opts)
         segs = md_mask.split_markdown_segments(filt.content_lines, filt.source_line_numbers)
         cell_texts = md_mask.get_table_cell_texts(filt.maps)
         SEG_DELIM = "⟦SEG⟧"
@@ -353,33 +354,39 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
                 prev_tail,
                 invariants,
                 term_map=chunk_term_map,
+                previous_choices=previous_choices,
             )
             if mock:
-                simulated = _mock_with_sentinels(SEG_DELIM.join(segs.texts_to_translate), chunk_term_map, invariants)
-                if chunk_term_map:
-                    try:
-                        qa_res = check_glossary_sentinel(simulated, chunk_term_map)
-                        if qa_res["status"] == "fail":
-                            raise RuntimeError(f"glossary sentinel lost in mock segment: {qa_res['violations']}")
-                    except RuntimeError:
-                        raise
-                    except Exception as e:
-                        raise RuntimeError(f"glossary sentinel check error in mock segment: {e}") from e
-                translated_seg_text = unmask_glossary_terms(simulated, chunk_term_map)
+                # Mock without glossary markers — only protect invariants + SEG delims
+                _he_single = re.compile(r"[א-ת]+")
+                protected: list[str] = []
+                if invariants:
+                    for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
+                        for v in invariants.get(cat, []):
+                            if v and v not in protected:
+                                protected.append(v)
+                for delim in ("⟦SEG⟧", "⟦CELL⟧"):
+                    if delim in SEG_DELIM.join(segs.texts_to_translate) and delim not in protected:
+                        protected.append(delim)
+                masked_payload = SEG_DELIM.join(segs.texts_to_translate)
+                if protected:
+                    protected_sorted = sorted(protected, key=len, reverse=True)
+                    pat = re.compile("|".join(re.escape(p) for p in protected_sorted))
+                    parts = pat.split(masked_payload)
+                    hits = pat.findall(masked_payload)
+                    wrapped_parts: list[str] = []
+                    for i, seg in enumerate(parts):
+                        wrapped_parts.append(_he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                        if i < len(hits):
+                            wrapped_parts.append(hits[i])
+                    simulated = "".join(wrapped_parts)
+                else:
+                    simulated = _he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), masked_payload)
+                translated_seg_text = simulated
                 res_seg = {"translation": translated_seg_text, "unknown_terms": [], "notes": ["mock"]}
             else:
                 res_seg = call_llm(base_url, api_key, model, seg_prompt)
                 translated_seg_text = res_seg["translation"]
-                if chunk_term_map:
-                    try:
-                        qa_res = check_glossary_sentinel(translated_seg_text, chunk_term_map)
-                        if qa_res["status"] == "fail":
-                            raise RuntimeError(f"glossary sentinel lost in segment: {qa_res['violations']}")
-                    except RuntimeError:
-                        raise
-                    except Exception as e:
-                        raise RuntimeError(f"glossary sentinel check error in segment: {e}") from e
-                translated_seg_text = unmask_glossary_terms(translated_seg_text, chunk_term_map)
             translated_segments = translated_seg_text.split(SEG_DELIM)
             if len(translated_segments) != len(segs.texts_to_translate):
                 raise RuntimeError(
@@ -393,17 +400,25 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
             if mock:
                 cell_delim = "⟦CELL⟧"
                 joined_cells = cell_delim.join(cell_texts)
-                simulated_cells = _mock_with_sentinels(joined_cells, chunk_term_map, None)
-                if chunk_term_map:
-                    try:
-                        qa_cell = check_glossary_sentinel(simulated_cells, chunk_term_map)
-                        if qa_cell["status"] == "fail":
-                            raise RuntimeError(f"glossary sentinel lost in mock table cell: {qa_cell['violations']}")
-                    except RuntimeError:
-                        raise
-                    except Exception as e:
-                        raise RuntimeError(f"glossary sentinel check error in mock table cell: {e}") from e
-                translated_cells_text = unmask_glossary_terms(simulated_cells, chunk_term_map)
+                _he_single2 = re.compile(r"[א-ת]+")
+                protected2: list[str] = []
+                for delim in ("⟦SEG⟧", "⟦CELL⟧"):
+                    if delim in joined_cells and delim not in protected2:
+                        protected2.append(delim)
+                if protected2:
+                    protected_sorted2 = sorted(protected2, key=len, reverse=True)
+                    pat2 = re.compile("|".join(re.escape(p) for p in protected_sorted2))
+                    parts2 = pat2.split(joined_cells)
+                    hits2 = pat2.findall(joined_cells)
+                    wrapped2: list[str] = []
+                    for i, seg in enumerate(parts2):
+                        wrapped2.append(_he_single2.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                        if i < len(hits2):
+                            wrapped2.append(hits2[i])
+                    simulated_cells = "".join(wrapped2)
+                else:
+                    simulated_cells = _he_single2.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), joined_cells)
+                translated_cells_text = simulated_cells
                 translated_cells = translated_cells_text.split(cell_delim)
                 if len(translated_cells) != len(cell_texts):
                     raise RuntimeError(
@@ -412,19 +427,9 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
             else:
                 cell_delim = "⟦CELL⟧"
                 joined_cells = cell_delim.join(cell_texts)
-                cell_prompt = build_prompt(joined_cells, section_path, g_rows, "", None, term_map=chunk_term_map)
+                cell_prompt = build_prompt(joined_cells, section_path, g_rows, "", None, term_map=chunk_term_map, previous_choices=previous_choices)
                 cr = call_llm(base_url, api_key, model, cell_prompt)
                 translated_cells_text = cr["translation"]
-                if chunk_term_map:
-                    try:
-                        qa_cell = check_glossary_sentinel(translated_cells_text, chunk_term_map)
-                        if qa_cell["status"] == "fail":
-                            raise RuntimeError(f"glossary sentinel lost in table cell: {qa_cell['violations']}")
-                    except RuntimeError:
-                        raise
-                    except Exception as e:
-                        raise RuntimeError(f"glossary sentinel check error in table cell: {e}") from e
-                translated_cells_text = unmask_glossary_terms(translated_cells_text, chunk_term_map)
                 translated_cells = translated_cells_text.split(cell_delim)
                 if len(translated_cells) != len(cell_texts):
                     raise RuntimeError(
@@ -439,33 +444,36 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
             "notes": res_seg.get("notes", []),
         }
     else:
-        prompt = build_prompt(masked_chunk, section_path, g_rows, prev_tail, invariants, term_map=chunk_term_map)
+        prompt = build_prompt(chunk_text, section_path, g_rows, prev_tail, invariants, term_map=chunk_term_map, previous_choices=previous_choices)
         if mock:
-            simulated = _mock_with_sentinels(masked_chunk, chunk_term_map, invariants)
-            if chunk_term_map:
-                try:
-                    qa_res = check_glossary_sentinel(simulated, chunk_term_map)
-                    if qa_res["status"] == "fail":
-                        raise RuntimeError(f"glossary sentinel lost in mock whole-doc: {qa_res['violations']}")
-                except RuntimeError:
-                    raise
-                except Exception as e:
-                    raise RuntimeError(f"glossary sentinel check error in mock whole-doc: {e}") from e
-            trans = unmask_glossary_terms(simulated, chunk_term_map)
+            _he_single3 = re.compile(r"[א-ת]+")
+            protected3: list[str] = []
+            if invariants:
+                for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
+                    for v in invariants.get(cat, []):
+                        if v and v not in protected3:
+                            protected3.append(v)
+            for delim in ("⟦SEG⟧", "⟦CELL⟧"):
+                if delim in chunk_text and delim not in protected3:
+                    protected3.append(delim)
+            if protected3:
+                protected_sorted3 = sorted(protected3, key=len, reverse=True)
+                pat3 = re.compile("|".join(re.escape(p) for p in protected_sorted3))
+                parts3 = pat3.split(chunk_text)
+                hits3 = pat3.findall(chunk_text)
+                wrapped3: list[str] = []
+                for i, seg in enumerate(parts3):
+                    wrapped3.append(_he_single3.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                    if i < len(hits3):
+                        wrapped3.append(hits3[i])
+                simulated = "".join(wrapped3)
+            else:
+                simulated = _he_single3.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), chunk_text)
+            trans = simulated
             res = {"translation": trans, "unknown_terms": [], "notes": ["mock"]}
         else:
             res = call_llm(base_url, api_key, model, prompt)
-            trans_sentinel = res["translation"]
-            if chunk_term_map:
-                try:
-                    qa_res = check_glossary_sentinel(trans_sentinel, chunk_term_map)
-                    if qa_res["status"] == "fail":
-                        raise RuntimeError(f"glossary sentinel lost in whole-doc: {qa_res['violations']}")
-                except RuntimeError:
-                    raise
-                except Exception as e:
-                    raise RuntimeError(f"glossary sentinel check error in whole-doc: {e}") from e
-            trans = unmask_glossary_terms(trans_sentinel, chunk_term_map)
+            trans = res["translation"]
             res["translation"] = trans
     missing = verify_all_preserved(invariants, trans)
     if missing:
@@ -504,7 +512,8 @@ def _translate_chunk_with_retry(chunk_text: str, section_path: str, prev_tail: s
                                 first_names: set[str], last_names: set[str],
                                 glossary: list[dict], base_url: str, api_key: str,
                                 model: str, mock: bool, no_mask: bool,
-                                retries: int) -> dict:
+                                retries: int,
+                                previous_choices: dict[str, str] | None = None) -> dict:
     """_translate_one_chunk plus bounded retries for model non-compliance.
 
     Scoping the retry to the chunk is the second half of HANDOFF §4.1: a dropped
@@ -515,7 +524,7 @@ def _translate_chunk_with_retry(chunk_text: str, section_path: str, prev_tail: s
         try:
             return _translate_one_chunk(chunk_text, section_path, prev_tail, first_names,
                                         last_names, glossary, base_url, api_key, model,
-                                        mock, no_mask)
+                                        mock, no_mask, previous_choices)
         except RuntimeError as e:
             if attempt >= retries or not _is_retryable_chunk_error(e):
                 raise
@@ -540,13 +549,14 @@ def _translate_chunks_with_term_map(raw_text: str, first_names: set[str], last_n
     chunk_translations: list[str] = []
     doc_unknown: list[str] = []
     all_notes: list[dict] = []
-    # Aggregated term_map keyed by (term_he, english, keep_source) with summed occurrences
-    agg_term_map: dict[tuple[str, str, bool], dict] = {}
+    # Aggregated term_map keyed by (term_he, tuple(sorted(translations)), keep_source) with summed occurrences
+    agg_term_map: dict[tuple[str, tuple[str, ...], bool], dict] = {}
     glossary_fp = _glossary_fingerprint(glossary) if out_root is not None else ""
     names_fp = names_fingerprint(first_names, last_names) if out_root is not None else ""
     code_fp = pipeline_code_fingerprint() if out_root is not None else ""
     reused = 0
     prev_tail = ""
+    doc_choices: dict[str, str] = {}
     for ch in chunks:
         chunk_text = ch["chunk_text"]
         section_path = ch["section_path"]
@@ -563,7 +573,7 @@ def _translate_chunks_with_term_map(raw_text: str, first_names: set[str], last_n
         if payload is None:
             payload = _translate_chunk_with_retry(
                 chunk_text, section_path, prev_tail, first_names, last_names, glossary,
-                base_url, api_key, model, mock, no_mask, chunk_retries)
+                base_url, api_key, model, mock, no_mask, chunk_retries, doc_choices if doc_choices else None)
             if key is not None:
                 try:
                     save_chunk_checkpoint(out_root, key, payload)
@@ -577,13 +587,44 @@ def _translate_chunks_with_term_map(raw_text: str, first_names: set[str], last_n
 
         trans = payload["translation"]
         chunk_term_map = payload.get("term_map") or []
+        # Track chosen translations for cross-chunk consistency
         for e in chunk_term_map:
-            key_tm = (e.get("term_he", ""), e.get("english", ""), bool(e.get("keep_source")))
+            term_he = e.get("term_he", "") or ""
+            if not term_he or term_he in doc_choices:
+                # keep first choice — do not overwrite
+                if term_he in doc_choices:
+                    continue
+            translations = e.get("translations") or []
+            if isinstance(translations, str):
+                translations = [translations] if translations.strip() else []
+            translations = [str(o).strip() for o in translations if str(o).strip()]
+            chosen = None
+            if e.get("keep_source"):
+                if term_he and term_he in trans:
+                    chosen = term_he
+            else:
+                for opt in translations:
+                    if _count_option(trans, opt) > 0:
+                        chosen = opt
+                        break
+                # fallback: simple substring if word-boundary missed
+                if chosen is None:
+                    for opt in translations:
+                        if opt in trans:
+                            chosen = opt
+                            break
+            if chosen is not None:
+                doc_choices[term_he] = chosen
+        for e in chunk_term_map:
+            translations = e.get("translations") or []
+            if isinstance(translations, str):
+                translations = [translations] if translations.strip() else []
+            translations = tuple(sorted(str(o).strip() for o in translations if str(o).strip()))
+            key_tm = (e.get("term_he", ""), translations, bool(e.get("keep_source")))
             if key_tm not in agg_term_map:
                 agg_term_map[key_tm] = {
-                    "id": e.get("id", 0),
                     "term_he": e["term_he"],
-                    "english": e["english"],
+                    "translations": list(translations),
                     "keep_source": bool(e.get("keep_source")),
                     "occurrences": int(e.get("occurrences", 0)),
                     "src_order": int(e.get("src_order", 0)),
@@ -603,8 +644,10 @@ def _translate_chunks_with_term_map(raw_text: str, first_names: set[str], last_n
     if reused:
         print(f"  resumed {reused}/{len(chunks)} chunks from checkpoints", file=sys.stderr)
     full_translation = "\n\n".join(chunk_translations)
-    # Preserve deterministic source order; keep original glossary ids for sentinel replay audit
-    term_map = sorted(agg_term_map.values(), key=lambda x: (x.get("src_order", 0), x["id"]))
+    for entry in agg_term_map.values():
+        entry["chosen"] = doc_choices.get(entry["term_he"])
+    # Preserve deterministic source order
+    term_map = sorted(agg_term_map.values(), key=lambda x: (x.get("src_order", 0), x["term_he"]))
     return full_translation, doc_unknown, all_notes, term_map
 
 
@@ -668,21 +711,27 @@ def translate_one_doc_with_fix(md_file: Path, vault_root: Path, out_root: Path,
     while failures and fix_rounds_used < fix_rounds:
         fix_rounds_used += 1
         if mock:
-            # Deterministic mock via masking with full approved glossary (catch inflected forms)
-            approved_for_fix = [r for r in glossary if (r.get("status") or "approved").strip() in ("approved", "keep_source") and (r.get("term_he") or "").strip()]
-            if approved_for_fix:
-                try:
-                    masked_raw, fix_term_map = mask_glossary_terms(raw_text, approved_for_fix)
-                    simulated_fix = _mock_with_sentinels(masked_raw, fix_term_map, full_invariants)
-                    new_body = unmask_glossary_terms(simulated_fix, fix_term_map)
-                    fixed = {"translation": new_body, "unknown_terms": [], "notes": ["mock fix"]}
-                except RuntimeError:
-                    raise
-                except FileNotFoundError as e:
-                    raise RuntimeError(f"YAP required for glossary masking — fail-closed: {e}") from e
+            # Deterministic mock — plain Hebrew marking outside invariants (no glossary markers)
+            _he_single = re.compile(r"[א-ת]+")
+            protected: list[str] = []
+            if full_invariants:
+                for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
+                    for v in full_invariants.get(cat, []):
+                        if v and v not in protected:
+                            protected.append(v)
+            if protected:
+                protected_sorted = sorted(protected, key=len, reverse=True)
+                pat = re.compile("|".join(re.escape(p) for p in protected_sorted))
+                parts = pat.split(raw_text)
+                hits = pat.findall(raw_text)
+                wrapped: list[str] = []
+                for i, seg in enumerate(parts):
+                    wrapped.append(_he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                    if i < len(hits):
+                        wrapped.append(hits[i])
+                new_body = "".join(wrapped)
             else:
-                fixed = mock_translate(raw_text, [], full_invariants)
-            new_body = fixed["translation"]
+                new_body = _he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), raw_text)
             fix_unknown_terms.extend(re.findall(r"⟦he:([^⟧]+)⟧", new_body))
         else:
             # For large docs, avoid silent 12k truncation by chunking the fix
@@ -770,7 +819,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Translate markdown chunks with glossary + name guard")
     ap.add_argument("vault_root", nargs="?", default=".", help="vault root")
     ap.add_argument("--input", dest="input_dir", default=None, help="corpus dir (default raw_md/raw)")
-    ap.add_argument("--glossary", default=None, help="glossary.csv path")
+    ap.add_argument("--glossary", default=None, help="glossary.json path")
     ap.add_argument("--out", dest="out_dir", default=None, help="output store dir")
     ap.add_argument("--check", action="store_true", help="only check glossary gate, exit 1 if blocked")
     ap.add_argument("--mock", action="store_true", help="offline mock (no LLM)")
@@ -779,7 +828,7 @@ def main(argv=None):
     ap.add_argument("--no-mask", action="store_true", help="disable md_mask placeholder masking (debug)")
     ap.add_argument("--limit", type=int, default=0, help="limit files (0=all)")
     ap.add_argument("--fix-rounds", type=int, default=None, help="max LLM fix rounds per doc after QA failures (default 3, 0=disable)")
-    ap.add_argument("--chunk-retries", type=int, default=None, help="retries per chunk on sentinel/delimiter loss (default 2, 0=disable, env TRANSLATE_CHUNK_RETRIES overrides config)")
+    ap.add_argument("--chunk-retries", type=int, default=None, help="retries per chunk on delimiter loss (default 2, 0=disable, env TRANSLATE_CHUNK_RETRIES overrides config)")
     args = ap.parse_args(argv)
 
     vault_root = Path(args.vault_root).resolve()
@@ -797,12 +846,7 @@ def main(argv=None):
         gp = Path(tcfg["glossary_path"])
         glossary_path = gp if gp.is_absolute() else vault_root / gp
     else:
-        glossary_path = vault_root / "data" / "domain_terms" / "glossary.csv"
-    # Fallback: glossary_proposed.csv if glossary.csv not yet created (pre-approval phase)
-    if not glossary_path.exists() and glossary_path.name == "glossary.csv":
-        alt = glossary_path.parent / "glossary_proposed.csv"
-        if alt.exists():
-            glossary_path = alt
+        glossary_path = vault_root / "data" / "domain_terms" / "glossary.json"
 
     if args.check:
         # Use shared check
@@ -1142,9 +1186,9 @@ __all__ = [
     "extract_yaml_frontmatter","extract_code_sections","extract_preservation_invariants",
     "verify_preserved","verify_all_preserved","verify_ordered","verify_all_ordered","verify_global_order",
     "chunk_markdown","glossary_for_chunk",
-    "mask_glossary_terms","unmask_glossary_terms",
+    "detect_glossary_terms","mask_glossary_terms","unmask_glossary_terms",
     "build_prompt","build_fix_prompt","_build_chunked_fix_prompts","format_qa_failures",
-    "call_llm","mock_translate","_mock_with_sentinels",
+    "call_llm","mock_translate",
     "run_qa_for_doc","translate_one_doc","translate_one_doc_with_fix","main",
     # constants
     "PERSON_OPEN","PERSON_CLOSE","EN_OPEN","EN_CLOSE","HE_MARKER_FMT",

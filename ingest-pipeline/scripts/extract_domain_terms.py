@@ -298,7 +298,23 @@ def scan_corpus(corpus_dir: Path):
         # also cover any surface not returned (fallback)
         for surf in unique_list:
             lemma = lemma_by_surface.get(surf, surf)
-            reduced = _hys._strip_hb_suffix(lemma)
+            # (2) YAP-aware definite-article strip: only for longer lemmas
+            # (len>4) to avoid false merge of בין (between, score 3.6) and
+            # הבין (understood, 0.46) — both would map to בין with naive strip.
+            # Longer terms like המדינה→מדינה, הסייבר→סייבר, הממשלה→ממשלה
+            # are safe (754 terms, ~24% of glossary_3223).
+            lemma_for_norm = lemma
+            if lemma.startswith("ה") and len(lemma) > 4:
+                cand = lemma[1:]
+                if cand and "א" <= cand[0] <= "ת":
+                    def _strong(s: str) -> str:
+                        red = _hys._strip_hb_suffix(s)
+                        weak = {"א", "ה", "ו", "י"}
+                        st = [c for c in red if "א" <= c <= "ת" and c not in weak]
+                        return "".join(st[:3]) if len(st) >= 3 else red
+                    if _strong(cand) == _strong(lemma):
+                        lemma_for_norm = cand
+            reduced = _hys._strip_hb_suffix(lemma_for_norm)
             weak = {"א", "ה", "ו", "י"}
             strong = [c for c in reduced if "א" <= c <= "ת" and c not in weak]
             if len(strong) >= 3:

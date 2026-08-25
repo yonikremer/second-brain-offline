@@ -4,11 +4,11 @@ Deduped from 5 places (check_glossary.py, glossary_translate.py,
 translation_qa.py, translation_reviewer.py, translate.py).
 
 This module is the single source of truth for:
-- CSV comment stripping (strip # / empty lines before DictReader)
-- Frontmatter stripping (--- block)
 - GFM table cell splitting (escaped pipes)
+- Frontmatter stripping (--- block)
+- Glossary collision/version helpers
 
-Import from here instead of copy-pasting.
+Glossary glossary.json schema: [{term_he, translations:[], keep_source, notes, status, example_doc}]
 """
 from __future__ import annotations
 
@@ -16,24 +16,13 @@ import hashlib
 import re
 from pathlib import Path
 
-GLOSSARY_SENTINEL_RE = re.compile(r"⟦EN:(\d+):[^⟧]+⟧")
+# KEEP sentinel retained only for keep_source fail-closed preservation.
+# EN sentinels removed — glossary is now prompt-only plain English.
 GLOSSARY_KEEP_RE = re.compile(r"⟦KEEP:[^⟧]+⟧")
-GLOSSARY_ANY_RE = re.compile(r"⟦(?:EN:\d+:[^⟧]+|KEEP:[^⟧]+)⟧")
-
-
-def build_glossary_sentinel(idx: int, english: str) -> str:
-    return f"⟦EN:{idx}:{english}⟧"
 
 
 def build_keep_sentinel(term_he: str) -> str:
     return f"⟦KEEP:{term_he}⟧"
-
-
-def parse_glossary_sentinel(s: str) -> tuple[int, str] | None:
-    m = re.match(r"⟦EN:(\d+):([^⟧]+)⟧", s)
-    if not m:
-        return None
-    return int(m.group(1)), m.group(2)
 
 
 def compute_glossary_version(glossary_path: Path) -> str:
@@ -43,22 +32,66 @@ def compute_glossary_version(glossary_path: Path) -> str:
     return h
 
 
+def _normalize_en_for_collision(en: str) -> str:
+    """Lowercase + strip leading 'the ' for collision key (glossary stores bare State, not The State)."""
+    return re.sub(r"^the\s+", "", en.strip().lower())
+
+
+def _valid_translation_option(t: str) -> bool:
+    """Filter invalid options before prompt injection (parenthetical truncation stubs).
+    Only drops notes like '(likely truncated from ...)' / '(likely ...', not valid glosses
+    like 'API (Application Programming Interface)' where '(' does not signal truncation.
+    """
+    if not t or not t.strip():
+        return False
+    low = t.lower()
+    if "likely" in low or "truncated" in low or "incomplete" in low:
+        return False
+    # isolated parenthetical stub like '(...)' is a note, not a translation
+    if t.strip().startswith("(") and t.strip().endswith(")"):
+        return False
+    return True
+
+
+def _filter_translations(raw) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw] if raw.strip() else []
+    if not raw:
+        return []
+    return [str(o).strip() for o in raw if _valid_translation_option(str(o))]
+
+
 def check_glossary_collisions(rows: list[dict]) -> None:
-    """M7: fail if duplicate english for different term_he or vice versa."""
+    """M7: fail on any collision.
+
+    - Within a row: translations must be unique (case-insensitive, The-normalized).
+    - Across rows: no two term_he may share any allowed rendering; no duplicate term_he.
+    """
     seen_en: dict[str, str] = {}
-    seen_he: dict[str, str] = {}
+    seen_he: set[str] = set()
     for r in rows:
         he = (r.get("term_he") or "").strip()
-        en = (r.get("english") or "").strip()
+        opts = _filter_translations(r.get("translations") or [])
+        if opts and len(opts) != len({_normalize_en_for_collision(o) for o in opts}):
+            raise RuntimeError(f"duplicate option inside {he!r}: {opts}")
         st = (r.get("status") or "approved").strip()
-        if st not in ("approved", "keep_source") or not he or not en:
+        if st not in ("approved", "keep_source") or not he:
             continue
-        if en in seen_en and seen_en[en] != he:
-            raise RuntimeError(f"glossary collision: english {en!r} maps to both {seen_en[en]!r} and {he!r}")
-        if he in seen_he and seen_he[he] != en:
-            raise RuntimeError(f"glossary collision: term {he!r} has conflicting english {seen_he[he]!r} vs {en!r}")
-        seen_en[en] = he
-        seen_he[he] = en
+        if st == "keep_source":
+            if he in seen_he:
+                raise RuntimeError(f"duplicate term_he {he!r}")
+            seen_he.add(he)
+            continue
+        if not opts:
+            continue
+        if he in seen_he:
+            raise RuntimeError(f"duplicate term_he {he!r}")
+        seen_he.add(he)
+        for en in opts:
+            key = _normalize_en_for_collision(en)
+            if key in seen_en and seen_en[key] != he:
+                raise RuntimeError(f"glossary collision: english {en!r} maps to both {seen_en[key]!r} and {he!r}")
+            seen_en[key] = he
 
 
 def strip_csv_comments(text: str) -> list[str]:

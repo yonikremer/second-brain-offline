@@ -8,7 +8,7 @@ CLI:
   python scripts/translation_reviewer.py [store_dir] [--vault-root PATH] [--glossary PATH] [--sample 0.2] [--seed 0] [--mock] [--out PATH]
   store_dir positional (default data/translations)
   --vault-root PATH   vault root (for convert_config.json + glossary resolution)
-  --glossary PATH     glossary.csv override (default vault/data/domain_terms/glossary.csv)
+  --glossary PATH     glossary.json override (default vault/data/domain_terms/glossary.json)
   --sample 0.2        sampling rate 0..1 (fractions via random.sample)
   --seed 0            random seed for deterministic sampling
   --mock              offline mock (no LLM, only glossary + structure sweep)
@@ -95,26 +95,45 @@ def _read_csv_skip_comments(path: Path) -> list[str]:
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 
 
-def load_glossary_terms(glossary_path: Path) -> dict[str, str]:
-    """term_he -> english (approved only)."""
-    terms: dict[str, str] = {}
-    if glossary_path.exists():
-        lines = _read_csv_skip_comments(glossary_path)
-        if not lines:
+def load_glossary_terms(glossary_path: Path) -> dict[str, list[str]]:
+    """term_he -> translations list (approved/keep_source only)."""
+    terms: dict[str, list[str]] = {}
+    if not glossary_path.exists():
+        return terms
+    if glossary_path.suffix == ".json":
+        try:
+            rows = json.loads(glossary_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
             return terms
-        reader = csv.DictReader(lines)
-        if reader.fieldnames:
-            for row in reader:
-                if (row.get("status") or "").strip() not in ("approved", "keep_source"):
-                    continue
-                he = (row.get("term_he") or "").strip()
-                en = (row.get("english") or "").strip()
-                if he and en:
-                    terms[he] = en
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if (row.get("status") or "").strip() not in ("approved", "keep_source"):
+                continue
+            he = (row.get("term_he") or "").strip()
+            translations = row.get("translations") or []
+            if isinstance(translations, str):
+                translations = [translations] if translations.strip() else []
+            translations = [str(o).strip() for o in translations if str(o).strip()]
+            if he and translations:
+                terms[he] = translations
+        return terms
+    lines = _read_csv_skip_comments(glossary_path)
+    if not lines:
+        return terms
+    reader = csv.DictReader(lines)
+    if reader.fieldnames:
+        for row in reader:
+            if (row.get("status") or "").strip() not in ("approved", "keep_source"):
+                continue
+            he = (row.get("term_he") or "").strip()
+            en = (row.get("english") or "").strip()
+            if he and en:
+                terms[he] = [en]
     return terms
 
 
-def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: dict[str, str]) -> list[dict]:
+def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: dict[str, list[str]]) -> list[dict]:
     """Flag leftover ⟦he:...⟧ markers for approved terms (not divergent-English detection).
 
     Currently only detects approved glossary terms still present as unresolved
@@ -131,7 +150,7 @@ def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: d
     # Heuristic: check if glossary English appears where Hebrew would have been
     # Simplified: flag if same English gloss appears inconsistently (e.g. two variants)
     # For now: only detect if marker still present for a term that has an approved gloss
-    for he, en in glossary_terms.items():
+    for he, opts in glossary_terms.items():
         docs_with_marker = []
         for path, body in translations:
             # Multi-word terms are marked per-word (⟦he:בינה⟧ ⟦he:מלאכותית⟧), so check all tokens
@@ -148,7 +167,7 @@ def glossary_consistency(translations: list[tuple[Path, str]], glossary_terms: d
             flags.append({
                 "type": "glossary_consistency",
                 "term_he": he,
-                "expected_en": en,
+                "expected_en": opts,
                 "note": f"{len(docs_with_marker)} docs still have unresolved marker for approved term",
                 "docs": docs_with_marker[:5],
             })
@@ -238,10 +257,10 @@ def main(argv=None):
         if not glossary_path.is_absolute():
             glossary_path = vault_root / glossary_path
     else:
-        glossary_path = vault_root / "data" / "domain_terms" / "glossary.csv"
-        # Fallback: if glossary.csv missing but glossary_proposed exists (pre-approval)
+        glossary_path = vault_root / "data" / "domain_terms" / "glossary.json"
+        # Fallback: if glossary.json missing but glossary_proposed exists (pre-approval)
         if not glossary_path.exists():
-            alt = vault_root / "data" / "domain_terms" / "glossary_proposed.csv"
+            alt = vault_root / "data" / "domain_terms" / "glossary_proposed.json"
             if alt.exists():
                 glossary_path = alt
 
