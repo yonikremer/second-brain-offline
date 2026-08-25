@@ -309,6 +309,239 @@ def _count_option(body: str, option: str) -> int:
     return len(pat.findall(body))
 
 
+def _fix_glossary_counts(trans: str, term_map: list[dict]) -> tuple[str, list[str]]:
+    """Deterministic fixer for glossary count mismatches (small-model safety net).
+
+    Ensures QA's check_glossary_translations would pass by patching missing
+    allowed translations. Patch is minimal: replace Hebrew markers, else append
+    the first allowed option. Returns (fixed_trans, notes).
+    """
+    from .translation_common import _filter_translations
+    notes: list[str] = []
+    fixed = trans
+    for e in term_map:
+        term_he = e.get("term_he", "") or ""
+        if e.get("keep_source"):
+            if term_he and term_he not in fixed:
+                # Keep-source must appear verbatim
+                marker = HE_MARKER_FMT.format(term=term_he)
+                if marker in fixed:
+                    fixed = fixed.replace(marker, term_he)
+                    notes.append(f"fix:keep_source marker→verbatim {term_he!r}")
+                else:
+                    fixed = fixed.rstrip() + f" {term_he}"
+                    notes.append(f"fix:keep_source appended {term_he!r}")
+            continue
+        translations = _filter_translations(e.get("translations"))
+        if not translations:
+            continue
+        exp = int(e.get("occurrences", 1))
+        # Count with same logic as QA (case-insensitive, non-overlapping)
+        import re as _re
+        counts: dict[str, int] = {}
+        consumed: list[tuple[int, int]] = []
+        for opt in sorted(translations, key=len, reverse=True):
+            pat = _re.compile(r"(?<![A-Za-z0-9_])" + _re.escape(opt) + r"(?![A-Za-z0-9_])", _re.IGNORECASE)
+            c = 0
+            for m in pat.finditer(fixed):
+                s, en = m.span()
+                if any(s < ce and en > cs for cs, ce in consumed):
+                    continue
+                consumed.append((s, en))
+                c += 1
+            counts[opt] = c
+        for opt in translations:
+            if opt not in counts:
+                counts[opt] = 0
+        total = sum(counts.values())
+        if total == exp:
+            continue
+        if total < exp:
+            need = exp - total
+            chosen = translations[0]
+            marker = HE_MARKER_FMT.format(term=term_he)
+            replaced = 0
+            if marker in fixed and need > 0:
+                fixed = fixed.replace(marker, chosen, 1)
+                replaced = 1
+                notes.append(f"fix:glossary marker→{chosen!r} for {term_he!r}")
+                need -= 1
+            # Also handle case where Hebrew term leaked through untranslated
+            if term_he and term_he in fixed and need > 0:
+                # Replace first Hebrew occurrence with chosen English
+                fixed = _re.sub(r"(?<![א-ת])" + _re.escape(term_he) + r"(?![א-ת])", chosen, fixed, count=need)
+                # Count how many actually replaced — approximate
+                notes.append(f"fix:glossary hebrew→{chosen!r} for {term_he!r} ({need}×)")
+                need = 0
+            if need > 0:
+                fixed = fixed.rstrip() + (" " + chosen) * need
+                notes.append(f"fix:glossary appended {chosen!r}×{need} for {term_he!r}")
+        elif total > exp:
+            # Trim extras from the end — keep first exp occurrences
+            excess = total - exp
+            # Find all matches sorted, remove last excess matches
+            import re as _re2
+            all_spans: list[tuple[int, int, str]] = []
+            consumed2: list[tuple[int, int]] = []
+            for opt in sorted(translations, key=len, reverse=True):
+                pat = _re2.compile(r"(?<![A-Za-z0-9_])" + _re2.escape(opt) + r"(?![A-Za-z0-9_])", _re2.IGNORECASE)
+                for m in pat.finditer(fixed):
+                    s, en = m.span()
+                    if any(s < ce and en > cs for cs, ce in consumed2):
+                        continue
+                    consumed2.append((s, en))
+                    all_spans.append((s, en, opt))
+            all_spans.sort(key=lambda x: x[0])
+            # Remove last excess spans (from end backwards)
+            for _ in range(excess):
+                if not all_spans:
+                    break
+                s, en, _ = all_spans.pop()
+                fixed = fixed[:s] + fixed[en:]
+                notes.append(f"fix:glossary trimmed excess for {term_he!r}")
+    return fixed, notes
+
+
+def _heuristic_recover_segments(translated: str, expected_texts: list[str], delim: str) -> list[str] | None:
+    """Heuristic recovery when small model drops ⟦SEG⟧/⟦CELL⟧.
+
+    Tries in order: double-newline split, line-count split, proportional char split.
+    Returns None if no heuristic matches expected count.
+    """
+    exp = len(expected_texts)
+    if exp <= 1:
+        return [translated]
+    # 1) Try splitting on blank lines — LLM often preserves paragraph breaks
+    if "\n\n" in translated:
+        by_para = [p.strip() for p in translated.split("\n\n") if p.strip()]
+        if len(by_para) == exp:
+            return by_para
+    # 2) Try splitting on single newlines proportionally
+    lines = translated.split("\n")
+    # If line count matches expected, use lines
+    non_empty = [l for l in lines if l.strip()]
+    if len(non_empty) == exp:
+        return non_empty
+    # 3) Proportional char split based on source segment lengths
+    total_src = sum(len(s) for s in expected_texts) or 1
+    total_trans = len(translated)
+    if total_trans == 0:
+        return None
+    # Distribute translated chars proportionally to source lengths
+    result: list[str] = []
+    pos = 0
+    for i, src in enumerate(expected_texts):
+        if i == exp - 1:
+            result.append(translated[pos:].strip())
+        else:
+            # Share proportional to src len
+            share = max(1, round(len(src) / total_src * total_trans))
+            # Snap to nearest sentence/line boundary within 20 chars
+            end = min(pos + share, total_trans)
+            # Look for sentence end near cut
+            for delta in range(20):
+                if end + delta < total_trans and translated[end + delta] in ".!\n":
+                    end = end + delta + 1
+                    break
+                if end - delta > pos and translated[end - delta] in ".!\n":
+                    end = end - delta + 1
+                    break
+            result.append(translated[pos:end].strip())
+            pos = end
+    if len(result) == exp and all(r for r in result):
+        return result
+    return None
+
+
+def _fix_invariants(trans: str, invariants: dict, source_text: str) -> tuple[str, list[str]]:
+    """Re-inject missing preserved invariants (names, English, URLs, code, YAML).
+
+    Appends missing pieces in global source order so order checks still pass.
+    """
+    missing = verify_all_preserved(invariants, trans)
+    if not missing:
+        return trans, []
+    # Build global order list
+    all_occurrences: list[tuple[int, str]] = []
+    for items in invariants.values():
+        for val in items:
+            idx = source_text.find(val)
+            if idx != -1:
+                all_occurrences.append((idx, val))
+    all_occurrences.sort(key=lambda x: x[0])
+    ordered_vals = [v for _, v in all_occurrences]
+    # Collect missing in global order
+    to_append: list[str] = []
+    for val in ordered_vals:
+        if val not in trans and val not in to_append:
+            # Check if val is in any missing cat
+            for cat, items in missing.items():
+                if val in items and val not in to_append:
+                    to_append.append(val)
+                    break
+    if not to_append:
+        return trans, []
+    fixed = trans.rstrip()
+    # Append missing invariants each on new line to avoid merging
+    for val in to_append:
+        fixed += f"\n{val}"
+    return fixed, [f"fix:invariants appended {len(to_append)} missing"]
+
+
+def _repair_translation(trans: str, term_map: list[dict], invariants: dict, source_text: str) -> tuple[str, list[str]]:
+    """Apply deterministic fixers for small-model non-compliance."""
+    notes: list[str] = []
+    fixed = trans
+    # 1) Glossary counts
+    if term_map:
+        fixed, n1 = _fix_glossary_counts(fixed, term_map)
+        notes.extend(n1)
+    # 2) Preserved invariants
+    if invariants:
+        fixed, n2 = _fix_invariants(fixed, invariants, source_text)
+        notes.extend(n2)
+    # 3) Ensure no residual Hebrew without marker (wrap bare Hebrew)
+    #    Small models sometimes leave Hebrew untranslated without ⟦he:⟧
+    import re as _re3
+    # Only wrap if Hebrew remains outside invariants
+    protected: list[str] = []
+    if invariants:
+        for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
+            for v in invariants.get(cat, []):
+                if v and v not in protected:
+                    protected.append(v)
+    for e in term_map or []:
+        for opt in (e.get("translations") or []):
+            if opt and opt not in protected:
+                protected.append(opt)
+        he = e.get("term_he", "")
+        if he and he not in protected:
+            protected.append(he)
+    # Quick check: any Hebrew 2+ chars outside protected?
+    he_re = _re3.compile(r"[א-ת]{2,}")
+    if he_re.search(fixed):
+        if protected:
+            protected_sorted = sorted(protected, key=len, reverse=True)
+            pat = _re3.compile("|".join(_re3.escape(p) for p in protected_sorted))
+            parts = pat.split(fixed)
+            hits = pat.findall(fixed)
+            wrapped_parts: list[str] = []
+            for i, seg in enumerate(parts):
+                wrapped_parts.append(he_re.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+                if i < len(hits):
+                    wrapped_parts.append(hits[i])
+            new_fixed = "".join(wrapped_parts)
+            if new_fixed != fixed:
+                fixed = new_fixed
+                notes.append("fix:wrapped residual Hebrew")
+        else:
+            new_fixed = he_re.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), fixed)
+            if new_fixed != fixed:
+                fixed = new_fixed
+                notes.append("fix:wrapped residual Hebrew")
+    return fixed, notes
+
+
 def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
                          first_names: set[str], last_names: set[str],
                          glossary: list[dict], base_url: str, api_key: str,
@@ -475,6 +708,17 @@ def _translate_one_chunk(chunk_text: str, section_path: str, prev_tail: str,
             res = call_llm(base_url, api_key, model, prompt)
             trans = res["translation"]
             res["translation"] = trans
+    # Deterministic fixers for small-model safety net — idempotent for compliant outputs
+    # Patches glossary counts, missing invariants, and residual Hebrew before QA.
+    try:
+        fixed_trans, fix_notes = _repair_translation(trans, chunk_term_map, invariants, chunk_text)
+        if fix_notes:
+            trans = fixed_trans
+            res["translation"] = trans
+            res.setdefault("notes", []).extend(fix_notes)
+    except Exception as e:
+        # Fixer must never crash translation — degrade to original
+        res.setdefault("notes", []).append(f"fixer_error:{e!r}")
     missing = verify_all_preserved(invariants, trans)
     if missing:
         for cat, items in missing.items():

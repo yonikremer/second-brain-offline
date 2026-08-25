@@ -27,12 +27,13 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
                 keep = e.get("keep_source", False)
                 is_keep = keep is True or keep == 1 or str(keep) == "1"
                 if is_keep:
-                    lines.append(f"  [{term_he}:KEEP as Hebrew] (appears {occ}×)")
+                    lines.append(f"  - \"{term_he}\" → KEEP exactly as \"{term_he}\" (appears {occ}×) — do not translate")
                 elif translations:
-                    opts = "|".join(translations)
-                    lines.append(f"  [{term_he}:{opts}] (appears {occ}×)")
+                    # Small-model-friendly: explicit choice list with quoted options
+                    opts_display = " OR ".join(f'"{o}"' for o in translations)
+                    lines.append(f"  - \"{term_he}\" → choose {opts_display} (appears {occ}×)")
             if lines:
-                glossary_block = "Glossary — for each Hebrew term, use exactly one of the allowed translations:\n" + "\n".join(lines) + "\n\n"
+                glossary_block = "Glossary — REQUIRED. For each Hebrew term below, you MUST use exactly one of the listed English options. Copy the option character-for-character:\n" + "\n".join(lines) + "\n\n"
     elif glossary_rows:
         lines = []
         for r in glossary_rows:
@@ -41,51 +42,53 @@ def build_prompt(chunk_text: str, section_path: str, glossary_rows: list[dict],
             ks = r.get("keep_source", "0")
             is_keep = ks == "1" or ks is True or str(ks) == "1" or r.get("status") == "keep_source"
             if is_keep:
-                lines.append(f"[{term}:KEEP as Hebrew]")
+                lines.append(f"\"{term}\"→KEEP \"{term}\"")
             elif translations:
-                opts = "|".join(translations)
-                lines.append(f"[{term}:{opts}]")
+                opts = " OR ".join(f'"{o}"' for o in translations)
+                lines.append(f"\"{term}\"→{opts}")
             # invalid-only terms are dropped entirely — do not emit "translate per context"
         if lines:
-            glossary_block = "Glossary — for each Hebrew term, use exactly one of the allowed translations:\n" + "\n".join(f"  {l}" for l in lines) + "\n\n"
+            glossary_block = "Glossary — REQUIRED. Use exactly one allowed translation per term:\n" + "\n".join(f"  - {l}" for l in lines) + "\n\n"
 
     prev_block = ""
     if prev_tail:
-        prev_block = f"Previous chunk tail (context only, do not re-emit):\n{prev_tail[:800]}\n\n"
+        prev_block = f"Previous chunk tail (context only, do not re-emit):\n{prev_tail[:400]}\n\n"
 
     # previous_choices is kept for back-compat but ignored (mixing allowed — no consistency block emitted)
     _ = previous_choices
 
-    # Preservation context
+    # Preservation context — trimmed for small models (≤12 per category, shorter preview)
     preserve_block = ""
     if invariants:
         parts: list[str] = []
-        for cat, label in [("yaml_frontmatter", "YAML frontmatter (keep exactly, first block)"),
-                           ("code_sections", "Code sections (fenced/inline — keep exactly, in order)"),
-                           ("person_names", "Person names (Hebrew — keep exactly, in order)"),
-                           ("english_spans", "English spans (Latin — keep verbatim, in order)"),
-                           ("urls_and_paths", "URLs/file-paths (keep verbatim, in order)")]:
+        for cat, label in [("yaml_frontmatter", "YAML frontmatter (copy exactly)"),
+                           ("code_sections", "Code blocks (copy exactly)"),
+                           ("person_names", "Person names (copy exactly)"),
+                           ("english_spans", "English terms (copy exactly)"),
+                           ("urls_and_paths", "URLs/paths (copy exactly)")]:
             items = invariants.get(cat) or []
             if items:
-                shown = items[:30]
+                shown = items[:12]
                 def _short(s: str) -> str:
-                    return s[:300] + ("…(truncated)" if len(s) > 300 else "")
+                    # Keep preview short — 120 chars is enough for model to recognise
+                    return s[:120] + ("…" if len(s) > 120 else "")
                 shown_short = [_short(s) for s in shown]
                 parts.append(f"{label}: {json.dumps(shown_short, ensure_ascii=False)}")
-                if len(items) > 30:
-                    parts[-1] += f" (+{len(items)-30} more)"
+                if len(items) > 12:
+                    parts[-1] += f" (+{len(items)-12} more)"
         if parts:
-            preserve_block = "Preserve verbatim IN ORDER — these strings from the source MUST appear exactly and in the same relative order in the output (code/YAML frontmatter included):\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
+            preserve_block = "MUST preserve verbatim (copy exactly, keep order):\n" + "\n".join(f"- {p}" for p in parts) + "\n\n"
 
     rules_block = (
-        f"Translate this Hebrew markdown chunk to faithful technical English.\n"
-        f"Rules:\n"
-        f"- For each glossary term listed above, use exactly one of its allowed translations. Do not invent alternatives.\n"
-        f"- Choose the translation that best fits the surrounding context; you may use different allowed renderings for different occurrences.\n"
-        f"- Preserve headings, lists, tables, code fences exactly (same counts) and in the same order.\n"
-        f"- Person names, English/URLs/code/YAML listed below must be copied verbatim and kept in the same relative order — do not translate, transliterate, reorder, or alter them.\n"
-        f"- Never invent translations for unknown terms — list them in unknown_terms and emit ⟦he:term⟧.\n"
-        f"- Output JSON: {{\"translation\": string, \"unknown_terms\": [string], \"notes\": [string]}}\n\n"
+        f"You are a Hebrew→English translator. Translate ONLY the Chunk below.\n"
+        f"RULES (follow all):\n"
+        f"1. GLOSSARY: For each term above, use EXACTLY one listed option, same spelling/case. Never invent another.\n"
+        f"2. If a word is unknown (not in glossary and not everyday Hebrew), emit ⟦he:word⟧ and list it in unknown_terms.\n"
+        f"3. PRESERVE: Copy every item under 'MUST preserve' exactly, same order. Do not translate or reformat them.\n"
+        f"4. MARKDOWN: Keep headings (#), lists (-/*), tables (|), code fences (```) counts and order identical.\n"
+        f"5. DELIMITERS: If you see ⟦SEG⟧ or ⟦CELL⟧, you MUST keep every occurrence and count. Never add or remove one.\n"
+        f"6. Output JSON only: {{\"translation\": \"...\", \"unknown_terms\": [], \"notes\": []}}\n"
+        f"   Example: {{\"translation\": \"# Title\\nTranslated paragraph.\", \"unknown_terms\": [], \"notes\": []}}\n\n"
     )
 
     return (

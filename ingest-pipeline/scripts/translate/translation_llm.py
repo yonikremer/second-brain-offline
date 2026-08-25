@@ -92,12 +92,56 @@ def _mock_with_sentinels(masked_text: str, term_map: list[dict], invariants: dic
     return mock_translate(masked_text, [dict(term_he=e.get("term_he"), translations=e.get("translations"), keep_source=e.get("keep_source"), status="approved") for e in term_map], invariants).get("translation", masked_text)
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Robust JSON extraction for small models that add preamble/fences."""
+    if not text:
+        return None
+    # Strip markdown fences like ```json ... ```
+    fence_re = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+    m = fence_re.search(text)
+    if m:
+        text = m.group(1)
+    # Find outermost JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    candidate = text[start:end+1]
+    # Small models sometimes escape newlines badly; try direct parse first
+    for attempt in (candidate, candidate.replace("\n", "\\n") if "\n" in candidate[:200] else None):
+        if attempt is None:
+            continue
+        try:
+            obj = json.loads(attempt)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    # Last resort: balance braces to find valid JSON prefix
+    depth = 0
+    for i, ch in enumerate(candidate):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(candidate[:i+1])
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    break
+    return None
+
+
 def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int = 3) -> dict:
     url = base_url.rstrip("/") + "/chat/completions"
+    # Small local models (gemma, qwen <35B) often do not support response_format=json_object;
+    # we request it but fall back to robust extraction if they ignore it.
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
     }).encode()
 
@@ -119,11 +163,26 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
             content = msg.get("content") if isinstance(msg, dict) else None
             if not content:
                 content = data["choices"][0]["message"]["content"]
-            obj = json.loads(content)
+            # Robust parse: small models may wrap JSON in fences or add preamble
+            obj = None
+            try:
+                obj = json.loads(content)
+            except Exception:
+                obj = _extract_json_object(content)
+            if obj is None:
+                # Fallback: treat whole content as translation (model ignored JSON)
+                # Wrap as single translation field so downstream QA still runs
+                raw = content.strip()
+                # If content looks like plain translation without JSON, accept it
+                if raw and "{" not in raw[:200]:
+                    return {"translation": raw, "unknown_terms": [], "notes": ["fallback: raw translation without JSON"]}
+                raise RuntimeError(f"LLM returned non-JSON content (first 300 chars): {content[:300]!r}")
+            if not isinstance(obj, dict):
+                raise RuntimeError(f"LLM returned non-object JSON: {type(obj)}")
             return {
                 "translation": str(obj.get("translation", "")).strip(),
-                "unknown_terms": list(obj.get("unknown_terms", [])),
-                "notes": list(obj.get("notes", [])),
+                "unknown_terms": list(obj.get("unknown_terms", [])) if isinstance(obj.get("unknown_terms"), list) else [],
+                "notes": list(obj.get("notes", [])) if isinstance(obj.get("notes"), list) else [],
             }
         except urllib.error.HTTPError as e:
             try:
