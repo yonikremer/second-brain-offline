@@ -56,6 +56,14 @@ def _valid_translation_option(t: str) -> bool:
     # Generic: if translation contains a parenthetical that itself contains Hebrew, it's an explanatory note
     if __import__("re").search(r"\([^)]*[א-ת][^)]*\)", t):
         return False
+    # Filter stray parenthesis Hebrew fragments like "בנמינה)" — unbalanced or Hebrew with trailing )
+    if t.strip().endswith(")") and "(" not in t:
+        return False
+    if t.strip().startswith("(") and ")" not in t:
+        return False
+    # Any Hebrew translation with unbalanced parens is invalid
+    if any(c in t for c in "()") and t.count("(") != t.count(")"):
+        return False
     return True
 
 
@@ -205,19 +213,4 @@ def load_person_names(vault_root: Path, exclude: set[str] | None = None) -> tupl
         last -= codenames
     return first, last
 
-# --- Deprecated sentinel compat (for tests that still import old names) ---
-GLOSSARY_SENTINEL_RE = re.compile(r"⟦EN:\d+(?::[^⟧]+)?⟧")
-GLOSSARY_ANY_RE = re.compile(r"⟦(?:EN:\d+(?::[^⟧]+)?|KEEP:[^⟧]+)⟧")
-
-def build_glossary_sentinel(idx: int, english: str = "") -> str:
-    if english:
-        return f"⟦EN:{idx}:{english}⟧"
-    return f"⟦EN:{idx}⟧"
-
-def parse_glossary_sentinel(s: str):
-    m = re.match(r"⟦EN:(\d+)(?::([^⟧]+))?⟧", s)
-    if not m:
-        return None
-    if m.group(2) is not None:
-        return int(m.group(1)), m.group(2)
-    return int(m.group(1)), ""
+""
