@@ -45,10 +45,16 @@ def _valid_translation_option(t: str) -> bool:
     if not t or not t.strip():
         return False
     low = t.lower()
-    if "likely" in low or "truncated" in low or "incomplete" in low:
+    if "likely" in low or "truncated" in low or "incomplete" in low or "usually" in low:
         return False
     # isolated parenthetical stub like '(...)' is a note, not a translation
     if t.strip().startswith("(") and t.strip().endswith(")"):
+        return False
+    # Heuristic: translation with explanatory parenthetical like "in scale (usually '...')" is a note
+    if "(" in t and ")" in t and len(t) > 30 and "usually" in low:
+        return False
+    # Generic: if translation contains a parenthetical that itself contains Hebrew, it's an explanatory note
+    if __import__("re").search(r"\([^)]*[א-ת][^)]*\)", t):
         return False
     return True
 
