@@ -124,7 +124,10 @@ def _payload_is_well_formed(payload: object) -> bool:
         if not isinstance(term_map, list):
             return False
         for e in term_map:
-            if not isinstance(e, dict) or "term_he" not in e or "english" not in e:
+            if not isinstance(e, dict) or "term_he" not in e:
+                return False
+            # New schema uses translations:[] ; old checkpoints used english:str
+            if "translations" not in e and "english" not in e:
                 return False
     for field in ("unknown", "notes", "person_names"):
         v = payload.get(field)

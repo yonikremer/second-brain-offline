@@ -1,10 +1,9 @@
 """LLM I/O — extracted from translate.py (pure move).
 
-I/O boundary with retries, urllib, mock sentinel-aware Hebrew marking.
+I/O boundary with retries, urllib, plain-text mock.
 """
 from __future__ import annotations
 
-import hashlib  # kept per Task 6 spec (parity with original LLM block)
 import json
 import re
 import sys
@@ -13,49 +12,84 @@ import urllib.error
 import urllib.request
 
 from .translation_invariants import HE_MARKER_FMT, HEBREW_WORD_RE
-from .translation_masking import mask_glossary_terms, unmask_glossary_terms
 
 
-def _mock_with_sentinels(masked_text: str, term_map: list[dict], invariants: dict | None = None) -> str:
-    """Simulate LLM preserving sentinels: wrap Hebrew outside protected spans."""
-    from .translation_common import build_glossary_sentinel, build_keep_sentinel
+def mock_translate(chunk_text: str, glossary_rows: list[dict], invariants: dict | None = None) -> dict:
+    """Deterministic mock: protect invariants + table markers, wrap Hebrew, pick first translation.
 
+    term_map is derived via detect_glossary_terms for consistency tracking,
+    but no sentinel embedding — output is plain English choices.
+    """
+    from .translation_masking import detect_glossary_terms
+
+    try:
+        term_map = detect_glossary_terms(chunk_text, glossary_rows)
+    except RuntimeError:
+        raise
+    except FileNotFoundError as e:
+        raise RuntimeError(f"YAP required for glossary detection — fail-closed: {e}") from e
+
+    # Determine chosen translation per term (first option for mock consistency)
+    chosen_map: dict[str, str] = {}
+    for e in term_map:
+        if e.get("keep_source"):
+            chosen_map[e["term_he"]] = e["term_he"]
+        else:
+            translations = e.get("translations") or []
+            if isinstance(translations, str):
+                translations = [translations] if translations.strip() else []
+            if translations:
+                chosen_map[e["term_he"]] = str(translations[0]).strip()
+
+    # Build protected: invariants + table markers
     protected: list[str] = []
     if invariants:
         for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
             for v in invariants.get(cat, []):
                 if v and v not in protected:
                     protected.append(v)
-    for e in term_map:
-        if e.get("keep_source"):
-            s = build_keep_sentinel(e.get("term_he", ""))
-        else:
-            try:
-                tid = int(e.get("id", 0))
-            except Exception:
-                tid = 0
-            s = build_glossary_sentinel(tid, e.get("english", ""))
-        if s and s not in protected:
-            protected.append(s)
     for delim in ("⟦SEG⟧", "⟦CELL⟧"):
-        if delim in masked_text and delim not in protected:
+        if delim in chunk_text and delim not in protected:
             protected.append(delim)
-    # Use single-char Hebrew pattern for mock to avoid residual single proclitic "ה" leak
-    _he_single = re.compile(r"[א-ת]+")
+
+    # Pre-replace detected glossary Hebrew with chosen English (simulate model picking a valid option)
+    mocked = chunk_text
+    # Replace longest Hebrew terms first to avoid partial overlap
+    for e in sorted(term_map, key=lambda x: len(x.get("term_he", "")), reverse=True):
+        he = e.get("term_he", "")
+        if not he:
+            continue
+        chosen = chosen_map.get(he, "")
+        if not chosen:
+            continue
+        # Simple substring replacement (YAP detection ensures correct matching boundary)
+        # For Hebrew inflected forms (הDBים), the mocked replacement just uses the chosen
+        # English at the detected position; fine for mock determinism.
+        # We replace exact term_he substring occurrences.
+        mocked = re.sub(r"(?<![א-ת])" + re.escape(he) + r"(?![א-ת])", chosen, mocked)
+
+    # Wrap remaining Hebrew outside protected spans
     if protected:
         protected_sorted = sorted(protected, key=len, reverse=True)
         pat = re.compile("|".join(re.escape(p) for p in protected_sorted))
-        parts = pat.split(masked_text)
-        sentinels = pat.findall(masked_text)
+        parts = pat.split(mocked)
+        sentinels = pat.findall(mocked)
         wrapped_parts: list[str] = []
         for i, seg in enumerate(parts):
-            wrapped_parts.append(_he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
+            wrapped_parts.append(HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
             if i < len(sentinels):
                 wrapped_parts.append(sentinels[i])
-        simulated = "".join(wrapped_parts)
+        mocked = "".join(wrapped_parts)
     else:
-        simulated = _he_single.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), masked_text)
-    return simulated
+        mocked = HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), mocked)
+
+    return {"translation": mocked, "unknown_terms": [], "notes": ["mock"]}
+
+
+# Legacy aliases for translate.py compat
+def _mock_with_sentinels(masked_text: str, term_map: list[dict], invariants: dict | None = None) -> str:
+    """Legacy: delegate to mock_translate on the original Hebrew side."""
+    return mock_translate(masked_text, [dict(term_he=e.get("term_he"), translations=e.get("translations"), keep_source=e.get("keep_source"), status="approved") for e in term_map], invariants).get("translation", masked_text)
 
 
 def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int = 3) -> dict:
@@ -84,7 +118,6 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
             msg = choice.get("message") if isinstance(choice, dict) else None
             content = msg.get("content") if isinstance(msg, dict) else None
             if not content:
-                # Fallback: original direct access for compat
                 content = data["choices"][0]["message"]["content"]
             obj = json.loads(content)
             return {
@@ -97,9 +130,7 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
                 body = e.read().decode(errors="replace")[:300]
             except Exception:
                 body = str(e)[:300]
-            # Do not echo raw body to ledger verbatim — it may contain document content
             last_err = f"HTTP {e.code}"
-            # Log body to stderr only (not persisted to ledger verbatim)
             print(f"LLM HTTP {e.code}: {body[:200]}", file=sys.stderr)
             if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
@@ -114,54 +145,3 @@ def call_llm(base_url: str, api_key: str, model: str, prompt: str, retries: int 
                 continue
             raise RuntimeError(f"LLM call failed after {retries} attempts: {last_err}") from e
     raise RuntimeError(last_err or "LLM exhausted retries")
-
-
-def mock_translate(chunk_text: str, glossary_rows: list[dict], invariants: dict | None = None) -> dict:
-    # Deterministic mock via masking reuse: mask → simulate LLM (Hebrew wrapping, sentinels preserved) → unmask
-    from .translation_common import build_glossary_sentinel, build_keep_sentinel
-
-    try:
-        masked, term_map = mask_glossary_terms(chunk_text, glossary_rows)
-    except RuntimeError:
-        raise
-    except FileNotFoundError as e:
-        raise RuntimeError(f"YAP required for glossary masking — fail-closed: {e}") from e
-
-    # Build protected list: invariants + sentinels + segment delimiters
-    protected: list[str] = []
-    if invariants:
-        for cat in ("yaml_frontmatter", "code_sections", "person_names", "english_spans", "urls_and_paths"):
-            for v in invariants.get(cat, []):
-                if v and v not in protected:
-                    protected.append(v)
-    for e in term_map:
-        if e.get("keep_source"):
-            s = build_keep_sentinel(e.get("term_he", ""))
-        else:
-            try:
-                tid = int(e.get("id", 0))
-            except Exception:
-                tid = 0
-            s = build_glossary_sentinel(tid, e.get("english", ""))
-        if s and s not in protected:
-            protected.append(s)
-    for delim in ("⟦SEG⟧", "⟦CELL⟧"):
-        if delim in masked and delim not in protected:
-            protected.append(delim)
-
-    if protected:
-        protected_sorted = sorted(protected, key=len, reverse=True)
-        pat = re.compile("|".join(re.escape(p) for p in protected_sorted))
-        parts = pat.split(masked)
-        sentinels = pat.findall(masked)
-        wrapped_parts: list[str] = []
-        for i, seg in enumerate(parts):
-            wrapped_parts.append(HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), seg))
-            if i < len(sentinels):
-                wrapped_parts.append(sentinels[i])
-        simulated = "".join(wrapped_parts)
-    else:
-        simulated = HEBREW_WORD_RE.sub(lambda m: HE_MARKER_FMT.format(term=m.group(0)), masked)
-
-    out = unmask_glossary_terms(simulated, term_map)
-    return {"translation": out, "unknown_terms": [], "notes": ["mock"]}

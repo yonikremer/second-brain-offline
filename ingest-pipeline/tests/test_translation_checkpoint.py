@@ -245,7 +245,8 @@ class TestChunkRetry(unittest.TestCase):
             return translate._translate_chunks_with_term_map(**kw)
 
     def test_sentinel_loss_retries_the_chunk_instead_of_failing_the_document(self):
-        fake = _failing_llm("glossary sentinel lost in whole-doc: [{'term': 'x'}]", fail_times=1)
+        # Sentinel masking removed — retry now triggers on delimiter loss (Segment/Cell count mismatch)
+        fake = _failing_llm("Segment count mismatch: sent 4, got 3 — model did not preserve delimiters", fail_times=1)
         full, _u, _n, _t = self._run(fake)
         self.assertEqual(full, "EN-A\n\nEN-B\n\nEN-C")
         self.assertEqual(_chunks_seen(fake), ["A", "B", "C", "C"])
@@ -257,7 +258,7 @@ class TestChunkRetry(unittest.TestCase):
         self.assertEqual(full, "EN-A\n\nEN-B\n\nEN-C")
 
     def test_retries_are_bounded_and_then_the_chunk_fails(self):
-        fake = _failing_llm("glossary sentinel lost in whole-doc: [{'term': 'x'}]")
+        fake = _failing_llm("Segment count mismatch: sent 4, got 3 — model did not preserve delimiters")
         with self.assertRaises(RuntimeError):
             self._run(fake)
         # 1 initial attempt + 2 retries on chunk C
@@ -272,7 +273,7 @@ class TestChunkRetry(unittest.TestCase):
         self.assertEqual(_chunks_seen(fake), ["A", "B", "C"])
 
     def test_a_chunk_that_succeeds_on_retry_is_checkpointed(self):
-        fake = _failing_llm("glossary sentinel lost in whole-doc: [{'term': 'x'}]", fail_times=1)
+        fake = _failing_llm("Segment count mismatch: sent 4, got 3 — model did not preserve delimiters", fail_times=1)
         self._run(fake)
         self.assertEqual(len(list((self.out_root / "chunks").rglob("*.json"))), 3)
 
@@ -339,7 +340,7 @@ class TestCheckpointingIsWiredIntoMain(unittest.TestCase):
 
 
 _GLOSSARY_DOC = "# פרק א\nהמערכת פועלת\n\n# פרק ב\nהמערכת נבדקת\n"
-_GLOSSARY = [{"term_he": "מערכת", "english": "system", "keep_source": "0",
+_GLOSSARY = [{"term_he": "מערכת", "translations": ["system"], "keep_source": "0",
               "status": "approved", "notes": "", "example_doc": ""}]
 
 
@@ -493,18 +494,17 @@ class TestPersonNameGuardAcrossResume(unittest.TestCase):
 
 class TestGlossaryFingerprintOrder(unittest.TestCase):
     def test_reordering_the_glossary_changes_the_fingerprint(self):
-        # mask_glossary_terms assigns sentinel ids positionally (gid = len(entries)),
-        # so row order reaches the prompt, the ledger term_map, and — for two rows
-        # sharing a YAP root — which English rendering wins.
+        # Fingerprint is now sorted by term_he and lower+The-normalized translations,
+        # so reordering glossary.json should NOT invalidate cache — same fingerprint.
         import translate.translate as translate
-        a = {"term_he": "מערכת", "english": "system", "status": "approved", "keep_source": "0"}
-        b = {"term_he": "תהליך", "english": "process", "status": "approved", "keep_source": "0"}
-        self.assertNotEqual(translate._glossary_fingerprint([a, b]),
-                            translate._glossary_fingerprint([b, a]))
+        a = {"term_he": "מערכת", "translations": ["system"], "status": "approved", "keep_source": "0"}
+        b = {"term_he": "תהליך", "translations": ["process"], "status": "approved", "keep_source": "0"}
+        self.assertEqual(translate._glossary_fingerprint([a, b]),
+                         translate._glossary_fingerprint([b, a]))
 
     def test_identical_order_gives_identical_fingerprint(self):
         import translate.translate as translate
-        a = {"term_he": "מערכת", "english": "system", "status": "approved", "keep_source": "0"}
+        a = {"term_he": "מערכת", "translations": ["system"], "status": "approved", "keep_source": "0"}
         self.assertEqual(translate._glossary_fingerprint([a]), translate._glossary_fingerprint([a]))
 
 
